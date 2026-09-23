@@ -19,6 +19,7 @@ const (
 	TypeFollowAsk    = "followAsk"
 	TypeFollowResult = "followResult"
 	TypeCursors      = "cursors"
+	TypeAck          = "ack"
 	TypeError        = "error"
 )
 
@@ -63,7 +64,16 @@ type Op struct {
 
 type Batch struct {
 	Type string `json:"type"`
+	Seq  int64  `json:"seq"`
 	Ops  []Op   `json:"ops"`
+}
+
+// Ack 表示这一批已经按顺序处理了 Applied 步。后面的步没有执行。
+type Ack struct {
+	Type    string `json:"type"`
+	Seq     int64  `json:"seq"`
+	Applied int    `json:"applied"`
+	Message string `json:"message,omitempty"`
 }
 
 type Suspend struct {

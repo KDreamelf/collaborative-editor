@@ -221,6 +221,13 @@ func (d *Doc) MergeUp(person string, line model.ID, holders []Presence) error {
 
 func (d *Doc) updateLive(key claimKey, live *liveClaim, content []string) error {
 	if key.action == model.ActionInsert {
+		// 同一份插入被重发时，段已经在链上，不能再接一次。
+		if live.spliced {
+			if seg, err := d.between(key.line, live.oldNext); err == nil && sameText(seg, content) {
+				live.content = content
+				return nil
+			}
+		}
 		delete(d.live, key)
 		return d.writeThrough(live.person, key, content)
 	}
@@ -447,6 +454,18 @@ func removeAll(in []string, victim string) []string {
 
 func removeAny(in []string, victims []string) []string {
 	return slices.DeleteFunc(in, func(s string) bool { return slices.Contains(victims, s) })
+}
+
+func sameText(seg []*model.Line, content []string) bool {
+	if len(seg) != len(content) {
+		return false
+	}
+	for i := range seg {
+		if seg[i].Content != content[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func earlier(tsA int64, personA string, tsB int64, personB string) bool {

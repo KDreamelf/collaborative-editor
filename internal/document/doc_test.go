@@ -280,6 +280,21 @@ func TestPasteConflictIsOneClaim(t *testing.T) {
 	}
 }
 
+func TestRepeatInsertDoesNotDuplicate(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("p1", line, model.ActionInsert, []string{"x", "y"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Submit("p1", line, model.ActionInsert, []string{"x", "y"}); err != nil {
+		t.Fatal(err)
+	}
+	again := view(t, d)
+	if len(again.Lines) != 3 || again.Lines[1].Content != "x" || again.Lines[2].Content != "y" {
+		t.Fatalf("同一份插入重发不应再接一段: %+v", again.Lines)
+	}
+}
+
 func TestDeleteAndMerge(t *testing.T) {
 	d := New("t")
 	if err := d.EnsureLines(2); err != nil {
