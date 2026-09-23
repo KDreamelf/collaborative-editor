@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/bin/
+*.exe
+*.test
+.env
+.wails/
+.DS_Store
+coverage.out
