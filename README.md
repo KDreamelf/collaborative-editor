@@ -28,3 +28,9 @@ npm run dev
 ```
 
 后台地址 `http://127.0.0.1:5174`，接口 `http://127.0.0.1:8787`。
+
+`fixture/` 是测试夹具，不进正式编译。`cases/*.jsonl` 才是用例。夹具用 ACP（Agent Client Protocol，标准输入输出上每行一条 JSON-RPC）执行用例里的操作。跑完按时间戳记在 `fixture/archive/`。
+
+```powershell
+go test -tags fixture ./fixture
+```

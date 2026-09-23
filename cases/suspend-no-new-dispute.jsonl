@@ -1,0 +1,16 @@
+{"op":"create","title":"t"}
+{"op":"edit","person":"p1","line":0,"text":"faded"}
+{"op":"suspend","person":"p1","line":0,"on":true}
+{"op":"edit","person":"p2","line":0,"text":"fresh"}
+
+{"expect":"line","line":0,"text":"fresh"}
+{"expect":"disputes","n":1}
+{"expect":"suspended","n":1}
+{"expect":"claim","person":"p1","text":"faded"}
+
+{"op":"suspend","person":"p1","line":0,"on":false}
+
+{"expect":"line","line":0,"text":"faded"}
+{"expect":"disputes","n":2}
+{"expect":"suspended","n":0}
+{"expect":"claim","person":"p2","text":"fresh"}

@@ -28,24 +28,181 @@ type FollowOutcome struct {
 	DisputeID  model.ID
 }
 
-// Submit 收下一个人的一份主张。
-// 这处没有别人还在写的主张时，直接写进正式行。
-// 有别人还在写，两份都留下，正式行回到撞上之前。后到的不盖先到的。
-// 对方已经挂起时，不拉争议，新内容直接进来。
+// Submit 收下一个人的一份主张。零扩展，兼容旧调用。
 func (d *Doc) Submit(person string, line model.ID, action string, content []string) error {
-	if action != model.ActionEdit && action != model.ActionInsert {
+	return d.SubmitWith(person, line, action, content, SubmitOpts{})
+}
+
+// SubmitWith 与 Submit 相同，另带 AfterSeen / BaseContent / LineIDs。
+// AfterSeen 仅用于「插在后面」：与锚点当前后继相同则同步堆叠；不同则未同步转争议。
+// BaseContent 仅用于「改这行」：与当前正式内容相同则已同步续写；落后且结果不同则开争议。
+// 失败路径（无效基准、无法提升）不得 detachFollow。
+func (d *Doc) SubmitWith(person string, line model.ID, action string, content []string, opts SubmitOpts) error {
+	if action != model.ActionEdit && action != model.ActionInsert && action != model.ActionDelete {
 		return ErrAction
-	}
-	if len(content) == 0 {
-		return ErrContent
 	}
 	if _, err := d.line(line); err != nil {
 		return err
 	}
+	// 删除主张一律走 DeleteIfIdle；detachFollow 在其成功路径内做，失败无副作用。
+	if action == model.ActionDelete {
+		return d.DeleteIfIdle(person, line, nil)
+	}
+	if len(content) == 0 {
+		return ErrContent
+	}
 	content = append([]string(nil), content...)
-	d.detachFollow(person, line, action)
+	if err := validateLineIDs(action, content, opts.LineIDs); err != nil {
+		return err
+	}
+	// 重发：行 ID 已在链上则无副作用确认，不覆盖后来的 live/正文。
+	if action == model.ActionInsert && len(opts.LineIDs) > 0 && d.alreadyHaveIDs(opts.LineIDs) {
+		return nil
+	}
+	if action == model.ActionEdit && len(content) > 1 && len(opts.LineIDs) > 0 && d.alreadyHaveIDs(opts.LineIDs) {
+		return nil
+	}
+	// 冲突 ID 在任何追随/归档/写链之前拒绝。
+	if err := d.checkNewLineIDs(opts.LineIDs); err != nil {
+		return err
+	}
 
 	key := claimKey{line, action}
+	if action == model.ActionInsert && opts.AfterSeen != nil {
+		currentNext := d.lines[line].Next
+		if *opts.AfterSeen == currentNext {
+			d.detachFollow(person, line, action)
+			if live := d.live[key]; live != nil && live.person != person {
+				d.archiveLiveInsert(line, live)
+				delete(d.live, key)
+			}
+			return d.submitApply(person, key, content, opts)
+		}
+		return d.submitStaleInsert(person, line, content, opts)
+	}
+
+	if action == model.ActionEdit && opts.BaseContent != nil {
+		// detachFollow 仅在 submitEditWithBase 成功变更路径内调用；ErrStaleEdit 等失败不得先拆追随。
+		return d.submitEditWithBase(person, line, content, opts)
+	}
+
+	// 无 AfterSeen 的并发插入：提升校验失败不得先拆追随。
+	if action == model.ActionInsert {
+		if live := d.live[key]; live != nil && live.person != person {
+			if _, err := d.planPromote(line, live); err != nil {
+				return err
+			}
+		}
+	}
+
+	d.detachFollow(person, line, action)
+	return d.submitApply(person, key, content, opts)
+}
+
+// submitEditWithBase：按客户端快照正文判定已同步续写或落后争议。
+// 挂起主张仍不挡 otherActive；带基准且落后时是否豁免挂起，待产品确认（ponytail: 易改点）。
+// 失败返回前不得 detachFollow / 改正文 / 改争议 / 改 live。
+func (d *Doc) submitEditWithBase(person string, line model.ID, content []string, opts SubmitOpts) error {
+	key := claimKey{line, model.ActionEdit}
+	base := *opts.BaseContent
+	ln := d.lines[line]
+	current := ln.Content
+
+	if otherActive(d.group(line, model.ActionEdit), person, d.suspended) {
+		d.detachFollow(person, line, model.ActionEdit)
+		d.upsert(person, line, model.ActionEdit, content, false)
+		return nil
+	}
+	if item := d.byPerson(line, model.ActionEdit, person); item != nil && d.live[key] == nil {
+		d.detachFollow(person, line, model.ActionEdit)
+		delete(d.suspended, item.ID)
+		item.Action = model.ActionEdit
+		item.Content = content
+		docs := d.group(line, model.ActionEdit)
+		if len(d.standers(docs)) == 1 && len(docs) == 1 {
+			saved := append([]string(nil), item.Content...)
+			delete(d.disputes, item.ID)
+			return d.writeThrough(person, key, saved, opts)
+		}
+		return nil
+	}
+	if live := d.live[key]; live != nil && live.person == person {
+		d.detachFollow(person, line, model.ActionEdit)
+		return d.updateLive(key, live, content, opts)
+	}
+
+	if base == current {
+		d.detachFollow(person, line, model.ActionEdit)
+		// 已同步续写：丢掉他人 live，不 revert（正文已是共同可见态）。
+		if live := d.live[key]; live != nil && live.person != person {
+			delete(d.live, key)
+			d.clearRecentEdit(line)
+		}
+		return d.writeThrough(person, key, content, opts)
+	}
+
+	// 基准落后：提交结果与当前正式相同则不新开争议。
+	if len(content) == 1 && content[0] == current {
+		return nil
+	}
+	return d.openStaleEditDispute(person, line, content, base)
+}
+
+// openStaleEditDispute：保留最新作者与提交者各一份，正式行回到共同基准。
+// live.before == base：直接共同基准，走 revert。
+// live.before != base：仅普通可恢复单行允许多代基准（正式行回提交者 base）；多行 splice 等仍 ErrStaleEdit。
+func (d *Doc) openStaleEditDispute(person string, line model.ID, content []string, base string) error {
+	key := claimKey{line, model.ActionEdit}
+	live := d.live[key]
+	if live != nil {
+		if live.before != base {
+			if err := d.checkMultiGenStaleEdit(live, line); err != nil {
+				return err
+			}
+			d.detachFollow(person, line, model.ActionEdit)
+			ln := d.lines[line]
+			ln.Content = base
+			d.clearRecentEdit(line)
+			d.clearEditOrigin([]model.ID{line})
+			delete(d.live, key)
+			d.upsert(live.person, line, model.ActionEdit, append([]string(nil), live.content...), false)
+			d.upsert(person, line, model.ActionEdit, content, false)
+			return nil
+		}
+		if err := d.revert(key, live); err != nil {
+			return err
+		}
+		d.detachFollow(person, line, model.ActionEdit)
+		delete(d.live, key)
+		d.upsert(live.person, line, model.ActionEdit, append([]string(nil), live.content...), false)
+		d.upsert(person, line, model.ActionEdit, content, false)
+		return nil
+	}
+
+	d.detachFollow(person, line, model.ActionEdit)
+	ln := d.lines[line]
+	current := ln.Content
+	ln.Content = base
+	d.clearRecentEdit(line)
+	d.upsert(CurrentBodyPerson, line, model.ActionEdit, []string{current}, false)
+	d.upsert(person, line, model.ActionEdit, content, false)
+	return nil
+}
+
+// checkMultiGenStaleEdit：只读。多代落后仅普通可恢复单行（无 splice 附属行/子主张）；失败零变化。
+func (d *Doc) checkMultiGenStaleEdit(live *liveClaim, line model.ID) error {
+	if !reversibleLineLive(live) || len(live.ids) > 0 {
+		return ErrStaleEdit
+	}
+	ln := d.lines[line]
+	if ln == nil || ln.Content != live.content[0] {
+		return ErrStaleEdit
+	}
+	return nil
+}
+
+func (d *Doc) submitApply(person string, key claimKey, content []string, opts SubmitOpts) error {
+	line, action := key.line, key.action
 	if otherActive(d.group(line, action), person, d.suspended) {
 		d.upsert(person, line, action, content, false)
 		return nil
@@ -55,25 +212,285 @@ func (d *Doc) Submit(person string, line model.ID, action string, content []stri
 	}
 	if item := d.byPerson(line, action, person); item != nil && d.live[key] == nil {
 		delete(d.suspended, item.ID)
+		item.Action = action
 		item.Content = content
 		docs := d.group(line, action)
 		if len(d.standers(docs)) == 1 && len(docs) == 1 {
 			saved := append([]string(nil), item.Content...)
 			delete(d.disputes, item.ID)
-			return d.writeThrough(person, key, saved)
+			return d.writeThrough(person, key, saved, opts)
 		}
 		return nil
 	}
 	if live := d.live[key]; live != nil && live.person == person {
-		return d.updateLive(key, live, content)
+		return d.updateLive(key, live, content, opts)
 	}
-	return d.writeThrough(person, key, content)
+	// Load 后已入链插入只在 history：同人再改仍收回该段再写。
+	if action == model.ActionInsert {
+		if claim := d.takeHistoryInsert(line, person); claim != nil {
+			d.live[key] = claim
+			return d.updateLive(key, claim, content, opts)
+		}
+	}
+	return d.writeThrough(person, key, content, opts)
+}
+
+// takeHistoryInsert：若 history 最新段仍接在锚点后且属此人，弹出供 updateLive。
+func (d *Doc) takeHistoryInsert(anchor model.ID, person string) *liveClaim {
+	hist := d.insertHistory[anchor]
+	if len(hist) == 0 {
+		return nil
+	}
+	last := hist[len(hist)-1]
+	if last == nil || last.person != person || !last.spliced || len(last.ids) == 0 {
+		return nil
+	}
+	head := d.lines[last.ids[0]]
+	if head == nil || d.lines[anchor] == nil || d.lines[anchor].Next != last.ids[0] {
+		return nil
+	}
+	d.insertHistory[anchor] = hist[:len(hist)-1]
+	if len(d.insertHistory[anchor]) == 0 {
+		delete(d.insertHistory, anchor)
+	}
+	return last
+}
+
+// submitStaleInsert：AfterSeen 与当前后继不符。
+// 从锚点当前 Next 走到 AfterSeen，把该锚点已同步插入收成每人一份候选再开争议。
+// 基准不在链上、跨入非本锚点段、或未支持的子操作：拒绝且不动正文。
+func (d *Doc) submitStaleInsert(person string, line model.ID, content []string, opts SubmitOpts) error {
+	key := claimKey{line, model.ActionInsert}
+	live := d.live[key]
+
+	if live != nil && live.person == person {
+		d.detachFollow(person, line, model.ActionInsert)
+		return d.updateLive(key, live, content, opts)
+	}
+	if opts.AfterSeen == nil {
+		return ErrStaleInsert
+	}
+
+	segs := d.collectAnchorInserts(line)
+	scoped, blockTexts, err := d.scopeInsertsByAfterSeen(line, *opts.AfterSeen, segs)
+	if err != nil {
+		return err
+	}
+	if slices.Equal(content, blockTexts) {
+		return nil
+	}
+
+	for _, seg := range scoped {
+		plans, err := d.planPromote(line, seg)
+		if err != nil {
+			return err
+		}
+		// 多段子编辑提升暂不支持；单段仍走 openInsertDispute。
+		if len(scoped) > 1 && len(plans) > 0 {
+			return ErrPromoteUnsafe
+		}
+	}
+
+	d.detachFollow(person, line, model.ActionInsert)
+	if len(scoped) == 1 {
+		return d.openInsertDispute(key, scoped[0], person, content)
+	}
+	return d.openStackedInsertDispute(key, scoped, person, content)
+}
+
+// collectAnchorInserts：该锚点已入链插入，旧→新（history 后接 live）。
+func (d *Doc) collectAnchorInserts(anchor model.ID) []*liveClaim {
+	var segs []*liveClaim
+	for _, s := range d.insertHistory[anchor] {
+		if s != nil && s.spliced && len(s.ids) > 0 {
+			segs = append(segs, s)
+		}
+	}
+	if live := d.live[claimKey{anchor, model.ActionInsert}]; live != nil && live.spliced && len(live.ids) > 0 {
+		segs = append(segs, live)
+	}
+	return segs
+}
+
+// scopeInsertsByAfterSeen：锚点 Next→AfterSeen 必须恰好等于本锚点若干连续插入段。
+// 返回旧→新 scoped，以及链上正文（新段在前）。
+// 段内子粘贴等会拉长 walk：先交给 planPromote 报 ErrPromoteUnsafe，避免误成 ErrBroken。
+func (d *Doc) scopeInsertsByAfterSeen(anchor model.ID, afterSeen model.ID, segs []*liveClaim) ([]*liveClaim, []string, error) {
+	base := d.lines[anchor]
+	if base == nil {
+		return nil, nil, ErrLine
+	}
+	var walk []model.ID
+	var texts []string
+	seen := map[model.ID]bool{}
+	id := base.Next
+	for id != afterSeen {
+		if id.IsZero() || seen[id] {
+			return nil, nil, ErrStaleInsert
+		}
+		ln := d.lines[id]
+		if ln == nil {
+			return nil, nil, ErrStaleInsert
+		}
+		seen[id] = true
+		walk = append(walk, id)
+		texts = append(texts, ln.Content)
+		id = ln.Next
+	}
+	if len(walk) == 0 {
+		return nil, nil, ErrStaleInsert
+	}
+
+	var covered []model.ID
+	var newestFirst []*liveClaim
+	for i := len(segs) - 1; i >= 0; i-- {
+		seg := segs[i]
+		if len(seg.ids) == 0 {
+			return nil, nil, ErrStaleInsert
+		}
+		for j, sid := range seg.ids {
+			ln := d.lines[sid]
+			if ln == nil {
+				return nil, nil, ErrBroken
+			}
+			if j > 0 && ln.Prev != seg.ids[j-1] {
+				return nil, nil, ErrBroken
+			}
+		}
+		if head := d.lines[seg.ids[0]]; head.InsertOrigin == nil || head.InsertOrigin.Person != seg.person || head.InsertOrigin.Anchor != anchor {
+			return nil, nil, ErrStaleInsert
+		}
+		covered = append(covered, seg.ids...)
+		newestFirst = append(newestFirst, seg)
+		if len(covered) >= len(walk) {
+			break
+		}
+	}
+	if !slices.Equal(covered, walk) {
+		for _, seg := range segs {
+			if _, err := d.planPromote(anchor, seg); err != nil {
+				return nil, nil, err
+			}
+		}
+		return nil, nil, ErrStaleInsert
+	}
+	if newestFirst[len(newestFirst)-1].oldNext != afterSeen {
+		return nil, nil, ErrStaleInsert
+	}
+	scoped := make([]*liveClaim, len(newestFirst))
+	for i, s := range newestFirst {
+		scoped[len(newestFirst)-1-i] = s
+	}
+	for _, seg := range scoped {
+		if err := d.checkSegmentUnlink(anchor, seg); err != nil {
+			if _, perr := d.planPromote(anchor, seg); perr != nil {
+				return nil, nil, perr
+			}
+			return nil, nil, err
+		}
+	}
+	return scoped, texts, nil
+}
+
+// layerInsertCandidates：按旧→新逐层前置，每人保留最后一次候选。
+func layerInsertCandidates(segs []*liveClaim) []promotePlan {
+	acc := []string{}
+	last := map[string][]string{}
+	var order []string
+	for _, seg := range segs {
+		layered := append(append([]string{}, seg.content...), acc...)
+		if _, ok := last[seg.person]; !ok {
+			order = append(order, seg.person)
+		}
+		last[seg.person] = layered
+		acc = layered
+	}
+	out := make([]promotePlan, 0, len(order))
+	for _, p := range order {
+		out = append(out, promotePlan{person: p, content: last[p]})
+	}
+	return out
+}
+
+func (d *Doc) forgetInsertSegs(anchor model.ID, segs []*liveClaim) {
+	heads := map[model.ID]bool{}
+	for _, s := range segs {
+		if s != nil && len(s.ids) > 0 {
+			heads[s.ids[0]] = true
+		}
+	}
+	if live := d.live[claimKey{anchor, model.ActionInsert}]; live != nil && len(live.ids) > 0 && heads[live.ids[0]] {
+		delete(d.live, claimKey{anchor, model.ActionInsert})
+	}
+	hist := d.insertHistory[anchor]
+	n := 0
+	for _, h := range hist {
+		if h != nil && len(h.ids) > 0 && heads[h.ids[0]] {
+			continue
+		}
+		hist[n] = h
+		n++
+	}
+	if n == 0 {
+		delete(d.insertHistory, anchor)
+	} else {
+		d.insertHistory[anchor] = hist[:n]
+	}
+}
+
+// openStackedInsertDispute：多段旧基准 → 层叠候选 + 新来者，逆序拆链。
+func (d *Doc) openStackedInsertDispute(key claimKey, segs []*liveClaim, person string, content []string) error {
+	cands := layerInsertCandidates(segs)
+	for i := len(segs) - 1; i >= 0; i-- {
+		seg := segs[i]
+		for _, id := range seg.ids {
+			delete(d.live, claimKey{id, model.ActionEdit})
+			delete(d.live, claimKey{id, model.ActionInsert})
+		}
+		d.clearInsertOrigin(seg.ids)
+		if err := d.unlinkSegment(seg.ids); err != nil {
+			return err
+		}
+	}
+	d.forgetInsertSegs(key.line, segs)
+	for _, c := range cands {
+		d.upsert(c.person, key.line, model.ActionInsert, c.content, false)
+	}
+	d.upsert(person, key.line, model.ActionInsert, content, false)
+	d.sweepPending()
+	return nil
+}
+
+func validateLineIDs(action string, content []string, ids []model.ID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	want := 0
+	switch action {
+	case model.ActionInsert:
+		want = len(content)
+	case model.ActionEdit:
+		if len(content) > 1 {
+			want = len(content) - 1
+		}
+	}
+	if len(ids) != want {
+		return ErrLineIDs
+	}
+	seen := map[model.ID]bool{}
+	for _, id := range ids {
+		if id.IsZero() || seen[id] {
+			return ErrLineIDs
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 // SetSuspended 挂起或恢复。挂起后别人来写不拉争议。主张还在，别人仍可以接受。
 // 已经接进正文的插入不再收回，否则挂起后再接受会把同一段再接一次。
 func (d *Doc) SetSuspended(person string, line model.ID, action string, suspended bool) error {
-	if action != model.ActionEdit && action != model.ActionInsert {
+	if action != model.ActionEdit && action != model.ActionInsert && action != model.ActionDelete {
 		return ErrAction
 	}
 	key := claimKey{line, action}
@@ -94,12 +511,19 @@ func (d *Doc) SetSuspended(person string, line model.ID, action string, suspende
 		return nil
 	}
 	if live.spliced {
+		// 已入链的插入来源要留着，未同步碰撞还靠它识别。
+		if action == model.ActionInsert {
+			d.archiveLiveInsert(line, live)
+		}
 		delete(d.live, key)
 		return nil
 	}
 	item := d.upsert(person, line, action, append([]string(nil), live.content...), true)
 	d.suspended[item.ID] = true
 	delete(d.live, key)
+	if action == model.ActionEdit {
+		d.clearRecentEdit(line)
+	}
 	return nil
 }
 
@@ -177,15 +601,24 @@ func (d *Doc) AnswerFollow(by, from string, target model.ID, accept bool) (Follo
 	return out, nil
 }
 
-// DeleteIfIdle 删掉空行。这行上还有别人没挂起的输入光标，就不删，拉争议。
-// 只剩一行时清空内容，不把链拆没。
+// DeleteIfIdle 删掉空行。非空行拒绝。已有编辑/删除争议、插入主张，或有人未挂起停留时，
+// 追加或更新删除主张，不清空已有争议。只剩一行时清空内容，不把链拆没。
 func (d *Doc) DeleteIfIdle(person string, line model.ID, holders []Presence) error {
 	ln, err := d.line(line)
 	if err != nil {
 		return err
 	}
-	if held(holders, person) {
-		d.holdDelete(person, ln, holders)
+	if ln.Content != "" {
+		return ErrNotEmpty
+	}
+	hasBody := len(d.group(line, model.ActionEdit)) > 0
+	hasInsert := len(d.group(line, model.ActionInsert)) > 0 || d.hasLiveInsert(line)
+	if held(holders, person) || hasBody || hasInsert {
+		if err := d.claimDelete(person, ln, holders); err != nil {
+			return err
+		}
+		d.detachFollow(person, line, model.ActionDelete)
+		d.tryResolve(line, model.ActionDelete)
 		return nil
 	}
 	if len(d.lines) == 1 {
@@ -199,7 +632,7 @@ func (d *Doc) DeleteIfIdle(person string, line model.ID, holders []Presence) err
 }
 
 // MergeUp 是行首退格：编辑前一行，把这一行接上去，再销毁这一行。
-// 这一行上还有人，整步不做。
+// 这一行还有未决主张时拒绝，保全内容。还有人未挂起停留时，改走删除主张。
 func (d *Doc) MergeUp(person string, line model.ID, holders []Presence) error {
 	ln, err := d.line(line)
 	if err != nil {
@@ -208,8 +641,15 @@ func (d *Doc) MergeUp(person string, line model.ID, holders []Presence) error {
 	if ln.Prev.IsZero() {
 		return nil
 	}
+	if len(d.group(line, model.ActionEdit)) > 0 || len(d.group(line, model.ActionInsert)) > 0 || d.blocksMergeLive(line, person) {
+		return ErrHasClaims
+	}
 	if held(holders, person) {
-		d.holdDelete(person, ln, holders)
+		if err := d.claimDelete(person, ln, holders); err != nil {
+			return err
+		}
+		d.detachFollow(person, line, model.ActionDelete)
+		d.tryResolve(line, model.ActionDelete)
 		return nil
 	}
 	prev := d.lines[ln.Prev]
@@ -219,33 +659,55 @@ func (d *Doc) MergeUp(person string, line model.ID, holders []Presence) error {
 	return d.Submit(person, prev.ID, model.ActionEdit, []string{joined})
 }
 
-func (d *Doc) updateLive(key claimKey, live *liveClaim, content []string) error {
+func (d *Doc) updateLive(key claimKey, live *liveClaim, content []string, opts SubmitOpts) error {
 	if key.action == model.ActionInsert {
 		// 同一份插入被重发时，段已经在链上，不能再接一次。
 		if live.spliced {
+			if len(live.ids) > 0 && d.alreadySpliced(live.ids, content) {
+				live.content = content
+				d.setInsertOrigin(live.ids, live.person, key.line, live.oldNext, content)
+				return nil
+			}
 			if seg, err := d.between(key.line, live.oldNext); err == nil && sameText(seg, content) {
 				live.content = content
+				if len(live.ids) > 0 {
+					d.setInsertOrigin(live.ids, live.person, key.line, live.oldNext, content)
+				}
 				return nil
+			}
+			if len(live.ids) > 0 {
+				d.clearInsertOrigin(live.ids)
+				if err := d.unlinkSegment(live.ids); err != nil {
+					return err
+				}
+			} else if live.spliced {
+				if err := d.revert(key, live); err != nil {
+					return err
+				}
 			}
 		}
 		delete(d.live, key)
-		return d.writeThrough(live.person, key, content)
+		return d.writeThrough(live.person, key, content, opts)
 	}
 	ln := d.lines[key.line]
 	live.content = content
 	ln.Content = content[0]
 	if len(content) > 1 && !live.spliced {
 		oldNext := ln.Next
-		if _, err := d.splice(key.line, content[1:]); err != nil {
+		ids, err := d.spliceIDs(key.line, content[1:], opts.LineIDs)
+		if err != nil {
 			return err
 		}
 		live.spliced = true
 		live.oldNext = oldNext
+		live.ids = ids
+		// 多行粘贴无法靠「最近编辑」恢复 splice 态。
+		d.clearRecentEdit(key.line)
 	}
 	return nil
 }
 
-func (d *Doc) writeThrough(person string, key claimKey, content []string) error {
+func (d *Doc) writeThrough(person string, key claimKey, content []string, opts SubmitOpts) error {
 	ln := d.lines[key.line]
 	fresh := &liveClaim{person: person, content: content}
 	if key.action == model.ActionEdit {
@@ -253,26 +715,40 @@ func (d *Doc) writeThrough(person string, key claimKey, content []string) error 
 		ln.Content = content[0]
 		if len(content) > 1 {
 			oldNext := ln.Next
-			if _, err := d.splice(key.line, content[1:]); err != nil {
+			ids, err := d.spliceIDs(key.line, content[1:], opts.LineIDs)
+			if err != nil {
 				ln.Content = fresh.before
 				return err
 			}
 			fresh.spliced = true
 			fresh.oldNext = oldNext
+			fresh.ids = ids
+			d.clearRecentEdit(key.line)
+		} else {
+			d.setRecentEdit(key.line, person, fresh.before)
 		}
 	} else {
 		oldNext := ln.Next
-		if _, err := d.splice(key.line, content); err != nil {
+		ids, err := d.spliceIDs(key.line, content, opts.LineIDs)
+		if err != nil {
 			return err
 		}
 		fresh.spliced = true
 		fresh.oldNext = oldNext
+		fresh.ids = ids
+		d.setInsertOrigin(ids, person, key.line, oldNext, content)
 	}
 	d.live[key] = fresh
 	return nil
 }
 
 func (d *Doc) openDispute(key claimKey, live *liveClaim, person string, content []string) error {
+	if key.action == model.ActionInsert {
+		if _, err := d.planPromote(key.line, live); err != nil {
+			return err
+		}
+		return d.openInsertDispute(key, live, person, content)
+	}
 	if err := d.revert(key, live); err != nil {
 		return err
 	}
@@ -282,13 +758,188 @@ func (d *Doc) openDispute(key claimKey, live *liveClaim, person string, content 
 	return nil
 }
 
+type promotePlan struct {
+	person  string
+	content []string
+	source  *model.Dispute // 非空则原地改成锚点插在后面，保留 ID/追随/挂起
+}
+
+// planPromote：只读检查。先扫不可提升依赖，再确认段可安全 unlink，最后收集提升方案。
+// 段内他人单行改这行可提升为整段插在后面；多行粘贴/子插入/删行等返回 ErrPromoteUnsafe。
+func (d *Doc) planPromote(anchor model.ID, seg *liveClaim) ([]promotePlan, error) {
+	if seg == nil || !seg.spliced {
+		return nil, nil
+	}
+	ids := seg.ids
+	if len(ids) == 0 {
+		if err := d.checkSegmentUnlink(anchor, seg); err != nil {
+			return nil, err
+		}
+		between, err := d.between(anchor, seg.oldNext)
+		if err != nil {
+			return nil, err
+		}
+		for _, ln := range between {
+			if d.hasUnsafeChildClaims(ln.ID) {
+				return nil, ErrPromoteUnsafe
+			}
+		}
+		return nil, nil
+	}
+	if len(ids) != len(seg.content) {
+		return nil, ErrPromoteUnsafe
+	}
+	for _, id := range ids {
+		if d.live[claimKey{id, model.ActionInsert}] != nil || len(d.group(id, model.ActionInsert)) > 0 {
+			return nil, ErrPromoteUnsafe
+		}
+		if live := d.live[claimKey{id, model.ActionEdit}]; live != nil {
+			if live.spliced || len(live.content) != 1 {
+				return nil, ErrPromoteUnsafe
+			}
+		}
+		for _, item := range d.group(id, model.ActionEdit) {
+			if item.Action == model.ActionDelete || len(item.Content) != 1 {
+				return nil, ErrPromoteUnsafe
+			}
+		}
+	}
+	if err := d.checkSegmentUnlink(anchor, seg); err != nil {
+		return nil, err
+	}
+
+	type hit struct {
+		index   int
+		text    string
+		dispute *model.Dispute
+	}
+	byPerson := map[string][]hit{}
+
+	for i, id := range ids {
+		for _, item := range d.group(id, model.ActionEdit) {
+			byPerson[item.Person] = append(byPerson[item.Person], hit{i, item.Content[0], item})
+		}
+		if live := d.live[claimKey{id, model.ActionEdit}]; live != nil {
+			byPerson[live.person] = append(byPerson[live.person], hit{i, live.content[0], nil})
+		}
+	}
+
+	var plans []promotePlan
+	for person, hits := range byPerson {
+		base := append([]string(nil), seg.content...)
+		var source *model.Dispute
+		seenIdx := map[int]bool{}
+		for _, h := range hits {
+			if h.index < 0 || h.index >= len(base) || seenIdx[h.index] {
+				return nil, ErrPromoteUnsafe
+			}
+			seenIdx[h.index] = true
+			base[h.index] = h.text
+			if h.dispute != nil {
+				if source != nil && source.ID != h.dispute.ID {
+					return nil, ErrPromoteUnsafe
+				}
+				source = h.dispute
+			}
+		}
+		plans = append(plans, promotePlan{person: person, content: base, source: source})
+	}
+	return plans, nil
+}
+
+func (d *Doc) hasUnsafeChildClaims(line model.ID) bool {
+	if d.live[claimKey{line, model.ActionInsert}] != nil {
+		return true
+	}
+	if live := d.live[claimKey{line, model.ActionEdit}]; live != nil {
+		if live.spliced || len(live.content) != 1 {
+			return true
+		}
+		return true // 无 ids 时无法安全对位提升
+	}
+	if len(d.group(line, model.ActionInsert)) > 0 {
+		return true
+	}
+	for _, item := range d.group(line, model.ActionEdit) {
+		if item.Action == model.ActionDelete || len(item.Content) != 1 {
+			return true
+		}
+		return true
+	}
+	return false
+}
+
+func (d *Doc) openInsertDispute(key claimKey, seg *liveClaim, person string, content []string) error {
+	plans, err := d.planPromote(key.line, seg)
+	if err != nil {
+		return err
+	}
+
+	authorContent := append([]string(nil), seg.content...)
+	promoted := map[string]bool{}
+
+	for _, p := range plans {
+		if p.person == seg.person {
+			authorContent = append([]string(nil), p.content...)
+			if p.source != nil {
+				delete(d.disputes, p.source.ID)
+				delete(d.suspended, p.source.ID)
+			}
+			continue
+		}
+		promoted[p.person] = true
+		if p.source != nil {
+			p.source.RealLine = key.line
+			p.source.Action = model.ActionInsert
+			p.source.Content = append([]string(nil), p.content...)
+		} else {
+			d.upsert(p.person, key.line, model.ActionInsert, p.content, false)
+		}
+	}
+
+	// 清段内子行 live；已提升的 dispute 已改 RealLine，unlink 时不会误删。
+	for _, id := range seg.ids {
+		delete(d.live, claimKey{id, model.ActionEdit})
+		delete(d.live, claimKey{id, model.ActionInsert})
+		for _, item := range append([]*model.Dispute(nil), d.group(id, model.ActionEdit)...) {
+			if item.RealLine != id {
+				continue
+			}
+			if item.Person == seg.person || promoted[item.Person] {
+				delete(d.disputes, item.ID)
+				delete(d.suspended, item.ID)
+			}
+		}
+	}
+
+	if err := d.revert(key, seg); err != nil {
+		return err
+	}
+	d.forgetInsertSegs(key.line, []*liveClaim{seg})
+
+	d.upsert(seg.person, key.line, model.ActionInsert, authorContent, false)
+	d.upsert(person, key.line, model.ActionInsert, content, false)
+	d.sweepPending()
+	return nil
+}
+
 func (d *Doc) revert(key claimKey, live *liveClaim) error {
+	if key.action == model.ActionEdit && len(live.baseIDs) >= 2 {
+		return d.revertSpan(live)
+	}
 	ln := d.lines[key.line]
 	if key.action == model.ActionEdit {
 		ln.Content = live.before
+		d.clearRecentEdit(key.line)
+		d.clearEditOrigin([]model.ID{key.line})
 	}
 	if !live.spliced {
 		return nil
+	}
+	// 只拆本段 ids，避免误伤同步堆叠在上面的别人的段。
+	if len(live.ids) > 0 {
+		d.clearInsertOrigin(live.ids)
+		return d.unlinkSegment(live.ids)
 	}
 	seg, err := d.between(key.line, live.oldNext)
 	if err != nil {
@@ -329,6 +980,7 @@ func (d *Doc) between(anchor, oldNext model.ID) ([]*model.Line, error) {
 
 func (d *Doc) upsert(person string, line model.ID, action string, content []string, keepSuspend bool) *model.Dispute {
 	if item := d.byPerson(line, action, person); item != nil {
+		item.Action = action
 		item.Content = content
 		if !keepSuspend {
 			delete(d.suspended, item.ID)
@@ -413,14 +1065,33 @@ func held(holders []Presence, self string) bool {
 	return false
 }
 
-func (d *Doc) holdDelete(person string, ln *model.Line, holders []Presence) {
-	content := []string{ln.Content}
-	d.upsert(person, ln.ID, model.ActionEdit, content, false)
-	for _, h := range holders {
-		if h.Active && h.Person != person {
-			d.upsert(h.Person, ln.ID, model.ActionEdit, content, false)
+// claimDelete：本人删除主张；未挂起的停留者保留行（改这行）。不伪造两份同样空文本。
+func (d *Doc) claimDelete(person string, ln *model.Line, holders []Presence) error {
+	key := claimKey{ln.ID, model.ActionEdit}
+	keepText := ln.Content
+	if live := d.live[key]; live != nil {
+		if len(live.content) > 0 {
+			keepText = live.content[0]
+		}
+		if err := d.revert(key, live); err != nil {
+			return err
+		}
+		delete(d.live, key)
+		if live.person != person {
+			d.upsert(live.person, ln.ID, model.ActionEdit, append([]string(nil), live.content...), false)
 		}
 	}
+	d.upsert(person, ln.ID, model.ActionDelete, []string{}, false)
+	for _, h := range holders {
+		if !h.Active || h.Person == person {
+			continue
+		}
+		if d.byPerson(ln.ID, model.ActionEdit, h.Person) != nil {
+			continue
+		}
+		d.upsert(h.Person, ln.ID, model.ActionEdit, []string{keepText}, false)
+	}
+	return nil
 }
 
 func (d *Doc) clearLineClaims(line model.ID) {
@@ -434,6 +1105,12 @@ func (d *Doc) clearLineClaims(line model.ID) {
 		if key.line == line {
 			delete(d.live, key)
 		}
+	}
+	delete(d.insertHistory, line)
+	if ln := d.lines[line]; ln != nil {
+		ln.InsertOrigin = nil
+		ln.RecentEdit = nil
+		ln.EditOrigin = nil
 	}
 	d.sweepPending()
 }
@@ -479,7 +1156,7 @@ func (d *Doc) findPending(from, to string, line model.ID, action string) (*follo
 	for i := range d.pending {
 		p := &d.pending[i]
 		item := d.disputes[p.dispute]
-		if p.from == from && p.to == to && item != nil && item.RealLine == line && item.Action == action {
+		if p.from == from && p.to == to && item != nil && item.RealLine == line && sameDisputeSlot(item.Action, action) {
 			return p, i
 		}
 	}
@@ -496,7 +1173,6 @@ func (d *Doc) pendingIndex(from, to string, dispute model.ID) int {
 }
 
 func (d *Doc) tryResolve(line model.ID, action string) {
-	key := claimKey{line, action}
 	docs := d.group(line, action)
 	if len(docs) == 0 {
 		return
@@ -517,14 +1193,29 @@ func (d *Doc) tryResolve(line model.ID, action string) {
 	if len(docs) == 1 && d.suspended[winner.ID] && len(winner.Followers) == 0 {
 		return
 	}
-	if live := d.live[key]; live != nil {
+	// 删除胜出时若还有未决插入主张或同锚点 live 插入：保留全部，暂缓决议。
+	if winner.Action == model.ActionDelete && (len(d.group(line, model.ActionInsert)) > 0 || d.hasLiveInsert(line)) {
+		return
+	}
+	// 只回滚同争议槽位的 live；编辑/删除组不动独立插入 live，反之亦然。
+	var liveKeys []claimKey
+	for key := range d.live {
+		if key.line == line && sameDisputeSlot(key.action, action) {
+			liveKeys = append(liveKeys, key)
+		}
+	}
+	for _, key := range liveKeys {
+		live := d.live[key]
+		if live == nil {
+			continue
+		}
 		if err := d.revert(key, live); err != nil {
 			return
 		}
 		delete(d.live, key)
 	}
 	content := append([]string(nil), winner.Content...)
-	if err := d.applyWinner(line, action, content); err != nil {
+	if err := d.applyWinner(winner.Person, line, winner.Action, content, winner.BaseIDs); err != nil {
 		return
 	}
 	for _, item := range docs {
@@ -532,9 +1223,12 @@ func (d *Doc) tryResolve(line model.ID, action string) {
 		delete(d.suspended, item.ID)
 	}
 	d.sweepPending()
+	if action == model.ActionInsert {
+		d.tryResolve(line, model.ActionDelete)
+	}
 }
 
-func (d *Doc) applyWinner(line model.ID, action string, content []string) error {
+func (d *Doc) applyWinner(person string, line model.ID, action string, content []string, baseIDs []model.ID) error {
 	ln, err := d.line(line)
 	if err != nil {
 		return err
@@ -544,15 +1238,52 @@ func (d *Doc) applyWinner(line model.ID, action string, content []string) error 
 		if len(content) == 0 {
 			return ErrContent
 		}
+		if len(baseIDs) >= 2 {
+			return d.applySpanWinner(person, baseIDs, content)
+		}
+		before := ln.Content
 		ln.Content = content[0]
 		if len(content) > 1 {
+			d.clearRecentEdit(line)
+			d.clearEditOrigin([]model.ID{line})
 			_, err = d.splice(line, content[1:])
 			return err
 		}
+		d.setRecentEdit(line, person, before)
+		d.live[claimKey{line, model.ActionEdit}] = &liveClaim{
+			person:  person,
+			content: append([]string(nil), content...),
+			before:  before,
+		}
 		return nil
 	case model.ActionInsert:
-		_, err = d.splice(line, content)
-		return err
+		oldNext := ln.Next
+		ids, err := d.splice(line, content)
+		if err != nil {
+			return err
+		}
+		d.setInsertOrigin(ids, person, line, oldNext, content)
+		// 胜出段进 history，不占 live，以免挡住同锚点删除收口。
+		d.archiveLiveInsert(line, &liveClaim{
+			person:  person,
+			content: append([]string(nil), content...),
+			oldNext: oldNext,
+			spliced: true,
+			ids:     append([]model.ID(nil), ids...),
+		})
+		return nil
+	case model.ActionDelete:
+		if len(d.group(line, model.ActionInsert)) > 0 || d.hasLiveInsert(line) {
+			return ErrHasClaims
+		}
+		if len(d.lines) == 1 {
+			ln.Content = ""
+			ln.RecentEdit = nil
+			ln.InsertOrigin = nil
+			return nil
+		}
+		d.unlink(ln)
+		return nil
 	default:
 		return ErrAction
 	}

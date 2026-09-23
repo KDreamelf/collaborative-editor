@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { formatUserError, httpFailureMessage, newLogId } from './errors'
 
 const STORAGE_KEY = 'admin-server-base'
 const DEFAULT_BASE = 'http://127.0.0.1:8787'
@@ -69,17 +70,20 @@ async function apiGet<T>(path: string): Promise<T> {
   try {
     res = await fetch(url)
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`网络错误\n${msg}`)
+    const id = newLogId()
+    console.error(`[${id}]`, e)
+    throw new Error('无法连接服务器')
   }
   const text = await res.text()
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}\n${text}`)
+    throw new Error(httpFailureMessage(res.status, text))
   }
   try {
     return JSON.parse(text) as T
-  } catch {
-    throw new Error(`HTTP ${res.status} ${res.statusText}\n响应不是 JSON\n${text}`)
+  } catch (e) {
+    const id = newLogId()
+    console.error(`[${id}]`, text, e)
+    throw new Error(`响应不是 JSON，日志编号 ${id}`)
   }
 }
 
@@ -96,7 +100,7 @@ async function refresh() {
       detail.value = null
     }
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
+    error.value = formatUserError(e)
   } finally {
     loading.value = false
   }
@@ -150,7 +154,6 @@ onMounted(async () => {
       <li v-for="a in articles" :key="a.id">
         <button type="button" @click="openArticle(a.id)">
           {{ a.title || '（无标题）' }}
-          <span class="id">{{ a.id }}</span>
         </button>
       </li>
     </ul>

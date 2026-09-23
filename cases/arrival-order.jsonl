@@ -1,0 +1,8 @@
+{"op":"create","title":"t"}
+{"op":"edit","person":"p2","line":0,"text":"后到的人先写"}
+{"op":"edit","person":"p1","line":0,"text":"先到的主张"}
+
+{"expect":"line","line":0,"text":""}
+{"expect":"disputes","n":2}
+{"expect":"claim","person":"p2","text":"后到的人先写"}
+{"expect":"claim","person":"p1","text":"先到的主张"}

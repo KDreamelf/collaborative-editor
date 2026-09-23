@@ -24,6 +24,9 @@ func SplitBSON(docs []bson.Raw) (Article, []Line, []Dispute, error) {
 			if d.Followers == nil {
 				d.Followers = []string{}
 			}
+			if d.Pending == nil {
+				d.Pending = []PendingConfirm{}
+			}
 			disputes = append(disputes, d)
 		case hasKey(raw, "标题"):
 			if seenArticle {

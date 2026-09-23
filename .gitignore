@@ -7,3 +7,4 @@ build/bin/
 .wails/
 .DS_Store
 coverage.out
+fixture/archive/

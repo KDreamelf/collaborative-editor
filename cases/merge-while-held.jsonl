@@ -1,0 +1,11 @@
+{"op":"create","title":"t"}
+{"op":"join","person":"p1","name":"甲"}
+{"op":"join","person":"p2","name":"乙"}
+{"op":"edit","person":"p1","line":0,"text":"ab"}
+{"op":"edit","person":"p1","line":1,"text":"cd"}
+{"op":"merge","person":"p1","line":1}
+
+{"expect":"lines","n":2}
+{"expect":"line","line":0,"text":"ab"}
+{"expect":"line","line":1,"text":""}
+{"expect":"disputes","n":2}

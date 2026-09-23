@@ -14,12 +14,24 @@ export function DeleteLine(arg1) {
   return window['go']['main']['App']['DeleteLine'](arg1);
 }
 
+export function DismissUnsynced(arg1) {
+  return window['go']['main']['App']['DismissUnsynced'](arg1);
+}
+
+export function GetCachedArticle() {
+  return window['go']['main']['App']['GetCachedArticle']();
+}
+
 export function Join(arg1, arg2) {
   return window['go']['main']['App']['Join'](arg1, arg2);
 }
 
 export function ListArticles() {
   return window['go']['main']['App']['ListArticles']();
+}
+
+export function ListUnsynced() {
+  return window['go']['main']['App']['ListUnsynced']();
 }
 
 export function MergeUp(arg1) {
@@ -32,6 +44,10 @@ export function MoveCaret(arg1, arg2, arg3, arg4) {
 
 export function PersonID() {
   return window['go']['main']['App']['PersonID']();
+}
+
+export function ReportError(arg1, arg2) {
+  return window['go']['main']['App']['ReportError'](arg1, arg2);
 }
 
 export function RequestFollow(arg1) {
@@ -52,6 +68,10 @@ export function SubmitInsert(arg1, arg2) {
 
 export function SubmitPaste(arg1, arg2) {
   return window['go']['main']['App']['SubmitPaste'](arg1, arg2);
+}
+
+export function SubmitSpanEdit(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SubmitSpanEdit'](arg1, arg2, arg3);
 }
 
 export function Suspend(arg1, arg2, arg3) {

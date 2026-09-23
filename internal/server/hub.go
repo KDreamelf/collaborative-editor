@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -28,6 +28,9 @@ type wsClient struct {
 }
 
 func (c *wsClient) send(data []byte) {
+	if c == nil || c.conn == nil {
+		return
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_ = c.conn.WriteMessage(websocket.TextMessage, data)
@@ -40,7 +43,9 @@ type room struct {
 	names     map[string]string
 	clients   map[*wsClient]struct{}
 	cursors   map[string]protocol.Cursor
-	dirty     bool
+	// ponytail: 进程内按 Op.ID 去重，重启即丢；队列很大再换有上限的结构。
+	seenOps map[string]struct{}
+	dirty   bool
 }
 
 type Hub struct {
@@ -408,6 +413,7 @@ func (h *Hub) join(r *room, client *wsClient, personID, name string) []outbound 
 	}
 	msgs := []outbound{{client, mustJSON(mine)}}
 	msgs = append(msgs, r.broadcastPayload(mustJSON(others), client)...)
+	msgs = append(msgs, r.pendingFollowAsks(personID)...)
 	return msgs
 }
 
@@ -415,63 +421,140 @@ func (h *Hub) applyBatch(r *room, client *wsClient, batch protocol.Batch) []outb
 	r.mu.Lock()
 	applied := 0
 	var failMsg string
+	var extra []outbound
 	for _, op := range batch.Ops {
-		var err error
-		switch op.Kind {
-		case protocol.TypeSubmit:
-			if op.Submit == nil {
-				err = errString("缺少 submit")
-				break
+		if op.ID != "" && r.seenOps != nil {
+			if _, ok := r.seenOps[op.ID]; ok {
+				applied++
+				continue
 			}
-			lineID, perr := model.ParseID(op.Submit.LineID)
-			if perr != nil {
-				err = perr
-				break
-			}
-			err = r.doc.Submit(op.Submit.PersonID, lineID, op.Submit.Action, op.Submit.Content)
-		case protocol.TypeDelete:
-			if op.Delete == nil {
-				err = errString("缺少 delete")
-				break
-			}
-			lineID, perr := model.ParseID(op.Delete.LineID)
-			if perr != nil {
-				err = perr
-				break
-			}
-			err = r.doc.DeleteIfIdle(op.Delete.PersonID, lineID, r.holdersFor(lineID))
-		case protocol.TypeMerge:
-			if op.Merge == nil {
-				err = errString("缺少 merge")
-				break
-			}
-			lineID, perr := model.ParseID(op.Merge.LineID)
-			if perr != nil {
-				err = perr
-				break
-			}
-			err = r.doc.MergeUp(op.Merge.PersonID, lineID, r.holdersFor(lineID))
-		default:
-			err = errString("未知操作: " + op.Kind)
 		}
+		msgs, err := r.applyBatchOp(client, op)
+		extra = append(extra, msgs...)
 		if err != nil {
 			failMsg = err.Error()
 			break
+		}
+		if op.ID != "" {
+			if r.seenOps == nil {
+				r.seenOps = map[string]struct{}{}
+			}
+			r.seenOps[op.ID] = struct{}{}
 		}
 		applied++
 	}
 	r.dirty = true
 	ack := protocol.Ack{Type: protocol.TypeAck, Seq: batch.Seq, Applied: applied, Message: failMsg}
 	snap, err := r.buildSnapshot("")
-	var msgs []outbound
+	// 目标连接须先拿到含 pending 的 Snapshot，再收 FollowAsk，否则本地 AnswerFollow 会 ErrNoDispute。
+	rest, asks := splitFollowAsks(extra)
+	msgs := rest
 	if client != nil {
 		msgs = append(msgs, outbound{client, mustJSON(ack)})
 	}
 	if err == nil {
 		msgs = append(msgs, r.broadcastPayload(mustJSON(snap), nil)...)
 	}
+	msgs = append(msgs, asks...)
 	r.mu.Unlock()
 	return msgs
+}
+
+func (r *room) applyBatchOp(client *wsClient, op protocol.Op) ([]outbound, error) {
+	switch op.Kind {
+	case protocol.TypeSubmit:
+		if op.Submit == nil {
+			return nil, errString("缺少 submit")
+		}
+		lineID, err := model.ParseID(op.Submit.LineID)
+		if err != nil {
+			return nil, err
+		}
+		opts := document.SubmitOpts{}
+		if op.Submit.AfterSeen != nil {
+			seen, err := model.ParseID(*op.Submit.AfterSeen)
+			if err != nil {
+				return nil, err
+			}
+			opts.AfterSeen = &seen
+		}
+		if op.Submit.BaseContent != nil {
+			cp := *op.Submit.BaseContent
+			opts.BaseContent = &cp
+		}
+		if len(op.Submit.LineIDs) > 0 {
+			opts.LineIDs = make([]model.ID, len(op.Submit.LineIDs))
+			for i, s := range op.Submit.LineIDs {
+				id, err := model.ParseID(s)
+				if err != nil || id.IsZero() {
+					return nil, document.ErrLineIDs
+				}
+				opts.LineIDs[i] = id
+			}
+		}
+		return nil, r.doc.SubmitWith(op.Submit.PersonID, lineID, op.Submit.Action, op.Submit.Content, opts)
+	case protocol.TypeSpanEdit:
+		opts, err := protocol.ParseSpanEditOpts(op.SpanEdit)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r.doc.SubmitSpanEdit(op.SpanEdit.PersonID, opts)
+	case protocol.TypeDelete:
+		if op.Delete == nil {
+			return nil, errString("缺少 delete")
+		}
+		lineID, err := model.ParseID(op.Delete.LineID)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r.doc.DeleteIfIdle(op.Delete.PersonID, lineID, r.holdersFor(lineID))
+	case protocol.TypeMerge:
+		if op.Merge == nil {
+			return nil, errString("缺少 merge")
+		}
+		lineID, err := model.ParseID(op.Merge.LineID)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r.doc.MergeUp(op.Merge.PersonID, lineID, r.holdersFor(lineID))
+	case protocol.TypeFollow:
+		if op.Follow == nil {
+			return nil, errString("缺少 follow")
+		}
+		disputeID, err := model.ParseID(op.Follow.DisputeID)
+		if err != nil {
+			return nil, err
+		}
+		out, err := r.doc.RequestFollow(op.Follow.PersonID, disputeID, op.Follow.ClientTs)
+		if err != nil {
+			return nil, err
+		}
+		return r.followNotify(client, *op.Follow, out), nil
+	case protocol.TypeFollowAnswer:
+		if op.FollowAnswer == nil {
+			return nil, errString("缺少 followAnswer")
+		}
+		disputeID, err := model.ParseID(op.FollowAnswer.DisputeID)
+		if err != nil {
+			return nil, err
+		}
+		out, err := r.doc.AnswerFollow(op.FollowAnswer.PersonID, op.FollowAnswer.FromID, disputeID, op.FollowAnswer.Accept)
+		if err != nil {
+			return nil, err
+		}
+		return r.answerNotify(*op.FollowAnswer, out), nil
+	case protocol.TypeSuspend:
+		if op.Suspend == nil {
+			return nil, errString("缺少 suspend")
+		}
+		lineID, err := model.ParseID(op.Suspend.LineID)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r.doc.SetSuspended(op.Suspend.PersonID, lineID, op.Suspend.Action, op.Suspend.Suspended)
+	default:
+		return nil, errString("未知操作: " + op.Kind)
+	}
 }
 
 func (h *Hub) suspend(r *room, msg protocol.Suspend) []outbound {
@@ -492,26 +575,25 @@ func (h *Hub) suspend(r *room, msg protocol.Suspend) []outbound {
 	return r.broadcastPayload(mustJSON(snap), nil)
 }
 
-func (h *Hub) follow(r *room, client *wsClient, msg protocol.Follow) []outbound {
-	r.mu.Lock()
-	disputeID, err := model.ParseID(msg.DisputeID)
-	var out document.FollowOutcome
-	if err == nil {
-		out, err = r.doc.RequestFollow(msg.PersonID, disputeID, msg.ClientTs)
+func followFromName(names map[string]string, personID, clientName string) string {
+	if clientName != "" {
+		return clientName
 	}
+	if n := names[personID]; n != "" {
+		return n
+	}
+	return "有人"
+}
+
+func (r *room) followNotify(client *wsClient, msg protocol.Follow, out document.FollowOutcome) []outbound {
 	var msgs []outbound
-	if err != nil {
-		if client != nil {
-			msgs = append(msgs, outbound{client, mustJSON(protocol.ErrMsg{Type: protocol.TypeError, Message: err.Error()})})
-		}
-		r.mu.Unlock()
-		return msgs
+	clientName := ""
+	if client != nil {
+		clientName = client.name
 	}
-	fromName := r.names[msg.PersonID]
-	if client != nil && client.name != "" {
-		fromName = client.name
-	}
+	fromName := followFromName(r.names, msg.PersonID, clientName)
 	if out.Status == document.FollowPending {
+		r.dirty = true
 		ask := protocol.FollowAsk{
 			Type:      protocol.TypeFollowAsk,
 			FromID:    msg.PersonID,
@@ -537,12 +619,84 @@ func (h *Hub) follow(r *room, client *wsClient, msg protocol.Follow) []outbound 
 				DisputeID: out.DisputeID.Hex(),
 			}))...)
 		}
+	}
+	return msgs
+}
+
+// pendingFollowAsks 把指向 personID 的待确认追随重发成 FollowAsk（join/rejoin 用）。
+func (r *room) pendingFollowAsks(personID string) []outbound {
+	v, err := r.doc.View()
+	if err != nil {
+		return nil
+	}
+	var msgs []outbound
+	for _, d := range v.Disputes {
+		for _, p := range d.Pending {
+			if p.To != personID {
+				continue
+			}
+			ask := protocol.FollowAsk{
+				Type:      protocol.TypeFollowAsk,
+				FromID:    p.From,
+				FromName:  followFromName(r.names, p.From, ""),
+				DisputeID: d.ID.Hex(),
+				ClientTs:  p.ClientTs,
+			}
+			msgs = append(msgs, r.toPerson(personID, mustJSON(ask))...)
+		}
+	}
+	return msgs
+}
+
+func (r *room) answerNotify(msg protocol.FollowAnswer, out document.FollowOutcome) []outbound {
+	resultSelf := protocol.FollowResult{Type: protocol.TypeFollowResult, Status: out.Status, DisputeID: msg.DisputeID}
+	resultPeer := protocol.FollowResult{Type: protocol.TypeFollowResult, Status: out.PeerStatus, DisputeID: msg.DisputeID}
+	msgs := r.toPerson(msg.PersonID, mustJSON(resultSelf))
+	msgs = append(msgs, r.toPerson(out.PeerID, mustJSON(resultPeer))...)
+	r.dirty = true
+	return msgs
+}
+
+func (h *Hub) follow(r *room, client *wsClient, msg protocol.Follow) []outbound {
+	r.mu.Lock()
+	disputeID, err := model.ParseID(msg.DisputeID)
+	var out document.FollowOutcome
+	if err == nil {
+		out, err = r.doc.RequestFollow(msg.PersonID, disputeID, msg.ClientTs)
+	}
+	var msgs []outbound
+	if err != nil {
+		if client != nil {
+			msgs = append(msgs, outbound{client, mustJSON(protocol.ErrMsg{Type: protocol.TypeError, Message: err.Error()})})
+		}
+		r.mu.Unlock()
+		return msgs
+	}
+	notify := r.followNotify(client, msg, out)
+	rest, asks := splitFollowAsks(notify)
+	msgs = rest
+	if out.Status == document.FollowApplied || out.Status == document.FollowLost || out.Status == document.FollowPending {
 		if snap, serr := r.buildSnapshot(""); serr == nil {
 			msgs = append(msgs, r.broadcastPayload(mustJSON(snap), nil)...)
 		}
 	}
+	msgs = append(msgs, asks...)
 	r.mu.Unlock()
 	return msgs
+}
+
+func splitFollowAsks(msgs []outbound) (rest, asks []outbound) {
+	for _, m := range msgs {
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(m.data, &head); err == nil && head.Type == protocol.TypeFollowAsk {
+			asks = append(asks, m)
+			continue
+		}
+		rest = append(rest, m)
+	}
+	return rest, asks
 }
 
 func (h *Hub) followAnswer(r *room, msg protocol.FollowAnswer) []outbound {
@@ -558,11 +712,7 @@ func (h *Hub) followAnswer(r *room, msg protocol.FollowAnswer) []outbound {
 		r.mu.Unlock()
 		return msgs
 	}
-	resultSelf := protocol.FollowResult{Type: protocol.TypeFollowResult, Status: out.Status, DisputeID: msg.DisputeID}
-	resultPeer := protocol.FollowResult{Type: protocol.TypeFollowResult, Status: out.PeerStatus, DisputeID: msg.DisputeID}
-	msgs = append(msgs, r.toPerson(msg.PersonID, mustJSON(resultSelf))...)
-	msgs = append(msgs, r.toPerson(out.PeerID, mustJSON(resultPeer))...)
-	r.dirty = true
+	msgs = r.answerNotify(msg, out)
 	if snap, serr := r.buildSnapshot(""); serr == nil {
 		msgs = append(msgs, r.broadcastPayload(mustJSON(snap), nil)...)
 	}

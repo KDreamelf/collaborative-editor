@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/KDreamelf/collaborative-editor/internal/document"
@@ -11,14 +13,23 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-func (a *App) pushOpLocked(op protocol.Op) {
+var errDialBusy = errors.New("正在连接")
+
+func (a *App) pushOpLocked(op protocol.Op) error {
+	if op.ID == "" {
+		op.ID = model.NewID().Hex()
+	}
 	now := time.Now()
 	if len(a.queue) == a.sentCount {
 		a.oldestAt = now
 	}
 	a.queue = append(a.queue, op)
 	a.lastEnqAt = now
+	if err := a.ensurePersistAfterPushLocked(); err != nil {
+		return err
+	}
 	a.armFlushLocked()
+	return nil
 }
 
 func (a *App) armFlushLocked() {
@@ -82,6 +93,9 @@ func (a *App) sendAfterEditsLocked(msg any) error {
 		}
 		return nil
 	}
+	if a.conn == nil {
+		return nil
+	}
 	return a.writeLocked(msg)
 }
 
@@ -131,7 +145,7 @@ func (a *App) sendBatchLocked() {
 
 func (a *App) writeLocked(v any) error {
 	if a.conn == nil {
-		return nil
+		return errors.New("未连接")
 	}
 	_ = a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := a.conn.WriteJSON(v)
@@ -143,7 +157,7 @@ func (a *App) connect() error {
 	a.mu.Lock()
 	if a.dialing {
 		a.mu.Unlock()
-		return nil
+		return errDialBusy
 	}
 	a.dialing = true
 	if a.conn != nil {
@@ -159,7 +173,7 @@ func (a *App) connect() error {
 		a.mu.Lock()
 		a.dialing = false
 		a.mu.Unlock()
-		return err
+		return fmt.Errorf("无法连接服务器")
 	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(ws, nil)
@@ -167,7 +181,7 @@ func (a *App) connect() error {
 	a.dialing = false
 	if err != nil {
 		a.mu.Unlock()
-		return err
+		return fmt.Errorf("无法连接服务器")
 	}
 	a.conn = conn
 	a.sentCount = 0
@@ -179,24 +193,44 @@ func (a *App) connect() error {
 		Name:      name,
 	}
 	err = a.writeLocked(join)
-	a.mu.Unlock()
 	if err != nil {
+		a.conn = nil
+		a.mu.Unlock()
 		_ = conn.Close()
 		return err
 	}
+	a.joined = true
+	a.emitOfflineLocked(false)
+	a.mu.Unlock()
 	go a.readLoop(conn)
 	return nil
 }
 
 func (a *App) reconnectLater() {
-	time.Sleep(time.Second)
-	a.mu.Lock()
-	articleID := a.articleID
-	a.mu.Unlock()
-	if articleID == "" {
-		return
+	wait := a.reconnectWait
+	if wait <= 0 {
+		wait = time.Second
 	}
-	_ = a.connect()
+	for {
+		time.Sleep(wait)
+		a.mu.Lock()
+		if a.articleID == "" || !a.joined {
+			a.mu.Unlock()
+			return
+		}
+		if a.conn != nil {
+			a.mu.Unlock()
+			return
+		}
+		if a.dialing {
+			a.mu.Unlock()
+			continue
+		}
+		a.mu.Unlock()
+		if err := a.connect(); err == nil {
+			return
+		}
+	}
 }
 
 func (a *App) readLoop(conn *websocket.Conn) {
@@ -208,9 +242,10 @@ func (a *App) readLoop(conn *websocket.Conn) {
 			a.sentSeq = 0
 		}
 		articleID := a.articleID
+		joined := a.joined
 		a.mu.Unlock()
 		_ = conn.Close()
-		if articleID != "" {
+		if articleID != "" && joined {
 			go a.reconnectLater()
 		}
 	}()
@@ -290,12 +325,16 @@ func (a *App) onAck(ack protocol.Ack) {
 	if ack.Seq != a.sentSeq || a.sentCount == 0 {
 		return
 	}
+	oldQueue := append([]protocol.Op(nil), a.queue...)
+	oldRejected := append([]rejectedOp(nil), a.rejected...)
+
 	drop := ack.Applied
-	if ack.Message != "" {
+	rejectedNow := false
+	if ack.Message != "" && drop < len(a.queue) {
+		failed := a.queue[drop]
+		a.rejected = append(a.rejected, newRejected(failed, ack.Message))
 		drop++
-		if a.ctx != nil {
-			runtime.EventsEmit(a.ctx, "error", ack.Message)
-		}
+		rejectedNow = true
 	}
 	if drop > len(a.queue) {
 		drop = len(a.queue)
@@ -308,6 +347,25 @@ func (a *App) onAck(ack protocol.Ack) {
 		a.lastEnqAt = a.oldestAt
 	} else {
 		a.oldestAt = time.Time{}
+	}
+	if err := a.savePersistLocked(); err != nil {
+		// 回退队列/拒绝列表；清 sent（本次 ack 已消费）。不立刻重发，等重连或后续入队。
+		a.queue = oldQueue
+		a.rejected = oldRejected
+		a.sentCount = 0
+		a.sentSeq = 0
+		a.oldestAt = time.Now()
+		a.lastEnqAt = a.oldestAt
+		if a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "error", "本地保存失败，请检查磁盘后重试")
+		}
+		return
+	}
+	if rejectedNow {
+		a.emitUnsyncedLocked()
+		if a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "error", "有一处修改未能同步到服务器，原文已保存在本地")
+		}
 	}
 	if len(a.deferred) > 0 {
 		a.drainDeferredLocked()
@@ -337,12 +395,16 @@ func (a *App) onSnapshot(snap protocol.Snapshot) {
 			_ = doc.SetSuspended(d.Person, d.RealLine, d.Action, true)
 		}
 	}
+	// 基准后继只来自服务端快照；先记再重放乐观队列，避免污染。
+	a.rememberServerSnapLocked(snap)
+	a.rememberAfterSeenLocked(snap.Lines)
 	a.doc = doc
 	a.people = snap.People
 	a.cursors = snap.Cursors
 	for _, op := range a.queue {
 		_ = a.applyOpLocked(op)
 	}
+	_ = a.savePersistLocked()
 	a.emitSnapshotLocked()
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "cursors", a.cursors)
@@ -378,7 +440,35 @@ func (a *App) applyOpLocked(op protocol.Op) error {
 		if err != nil {
 			return err
 		}
-		return a.doc.Submit(s.PersonID, id, s.Action, append([]string(nil), s.Content...))
+		opts := document.SubmitOpts{}
+		if s.AfterSeen != nil {
+			seen, err := model.ParseID(*s.AfterSeen)
+			if err != nil {
+				return err
+			}
+			opts.AfterSeen = &seen
+		}
+		if s.BaseContent != nil {
+			cp := *s.BaseContent
+			opts.BaseContent = &cp
+		}
+		if len(s.LineIDs) > 0 {
+			opts.LineIDs = make([]model.ID, len(s.LineIDs))
+			for i, raw := range s.LineIDs {
+				lid, err := model.ParseID(raw)
+				if err != nil {
+					return err
+				}
+				opts.LineIDs[i] = lid
+			}
+		}
+		return a.doc.SubmitWith(s.PersonID, id, s.Action, append([]string(nil), s.Content...), opts)
+	case protocol.TypeSpanEdit:
+		opts, err := protocol.ParseSpanEditOpts(op.SpanEdit)
+		if err != nil {
+			return err
+		}
+		return a.doc.SubmitSpanEdit(op.SpanEdit.PersonID, opts)
 	case protocol.TypeDelete:
 		d := op.Delete
 		if d == nil {
@@ -399,6 +489,38 @@ func (a *App) applyOpLocked(op protocol.Op) error {
 			return err
 		}
 		return a.doc.MergeUp(m.PersonID, id, a.holdersLocked(m.LineID))
+	case protocol.TypeFollow:
+		f := op.Follow
+		if f == nil {
+			return nil
+		}
+		id, err := model.ParseID(f.DisputeID)
+		if err != nil {
+			return err
+		}
+		_, err = a.doc.RequestFollow(f.PersonID, id, f.ClientTs)
+		return err
+	case protocol.TypeFollowAnswer:
+		ans := op.FollowAnswer
+		if ans == nil {
+			return nil
+		}
+		id, err := model.ParseID(ans.DisputeID)
+		if err != nil {
+			return err
+		}
+		_, err = a.doc.AnswerFollow(ans.PersonID, ans.FromID, id, ans.Accept)
+		return err
+	case protocol.TypeSuspend:
+		s := op.Suspend
+		if s == nil {
+			return nil
+		}
+		id, err := model.ParseID(s.LineID)
+		if err != nil {
+			return err
+		}
+		return a.doc.SetSuspended(s.PersonID, id, s.Action, s.Suspended)
 	default:
 		return nil
 	}

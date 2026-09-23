@@ -1,0 +1,16 @@
+{"op":"create","title":"t"}
+{"op":"edit","person":"p1","line":0,"lines":["hello","world"]}
+{"op":"edit","person":"p2","line":0,"text":"no"}
+
+{"expect":"lines","n":1}
+{"expect":"line","line":0,"text":""}
+{"expect":"disputes","n":2}
+{"expect":"claim","person":"p1","lines":["hello","world"]}
+
+{"op":"follow","person":"p2","target":"p1","ts":1}
+{"op":"answer","person":"p1","from":"p2","accept":true}
+
+{"expect":"disputes","n":0}
+{"expect":"lines","n":2}
+{"expect":"line","line":0,"text":"hello"}
+{"expect":"line","line":1,"text":"world"}

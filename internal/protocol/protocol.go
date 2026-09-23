@@ -1,6 +1,11 @@
 package protocol
 
-import "github.com/KDreamelf/collaborative-editor/internal/document"
+import (
+	"fmt"
+
+	"github.com/KDreamelf/collaborative-editor/internal/document"
+	"github.com/KDreamelf/collaborative-editor/internal/model"
+)
 
 // 页面和服务器之间的消息。主张、追随走这条转发，不走打洞。
 // 光标现在也走转发。打洞以后再换，消息形状不用动。
@@ -9,6 +14,7 @@ const (
 	TypeJoin         = "join"
 	TypeBatch        = "batch"
 	TypeSubmit       = "submit"
+	TypeSpanEdit     = "spanEdit"
 	TypeSuspend      = "suspend"
 	TypeFollow       = "follow"
 	TypeFollowAnswer = "followAnswer"
@@ -45,21 +51,107 @@ type Join struct {
 }
 
 // Submit 是一份主张。
+// AfterSeen：客户端最后已应用的服务端快照里，锚点当时的后继 ID。
+// nil=字段缺失（兼容旧包）；非 nil 且空串=已知末尾。乐观本地改动不能写进这个基准。
+// BaseContent：改这行时，快照里该行当时的正式内容。nil=旧包；非 nil（含空串）=已知基准。
+// LineIDs：客户端预生的新正式行 ID。插在后面时与 Content 等长；改这行多行粘贴时对应 Content[1:]。
 type Submit struct {
-	Type     string   `json:"type"`
-	PersonID string   `json:"personId"`
-	LineID   string   `json:"lineId"`
-	Action   string   `json:"action"`
-	Content  []string `json:"content"`
-	ClientTs int64    `json:"clientTs"`
+	Type        string   `json:"type"`
+	PersonID    string   `json:"personId"`
+	LineID      string   `json:"lineId"`
+	Action      string   `json:"action"`
+	Content     []string `json:"content"`
+	ClientTs    int64    `json:"clientTs"`
+	AfterSeen   *string  `json:"afterSeen,omitempty"`
+	BaseContent *string  `json:"baseContent,omitempty"`
+	LineIDs     []string `json:"lineIds,omitempty"`
+}
+
+// SpanEdit 跨多条正式行的一次整段替换。独立 kind，旧服务端遇未知 kind 会拒绝，避免误当单行粘贴。
+// AfterSeen 空串=已知文末。BaseIDs 至少 2；LineIDs 对应 Replacement[1:]。
+type SpanEdit struct {
+	Type        string   `json:"type"`
+	PersonID    string   `json:"personId"`
+	BaseIDs     []string `json:"baseIds"`
+	BaseTexts   []string `json:"baseTexts"`
+	AfterSeen   string   `json:"afterSeen"`
+	Replacement []string `json:"replacement"`
+	LineIDs     []string `json:"lineIds,omitempty"`
+	ClientTs    int64    `json:"clientTs"`
 }
 
 // Op 是队列里的一步。批量只是一起送，不把几步并成一份主张。
+// ID 由客户端生成，服务端按它去重，重连重发不会再执行一遍。
 type Op struct {
-	Kind   string  `json:"kind"` // submit、delete、merge
-	Submit *Submit `json:"submit,omitempty"`
-	Delete *Delete `json:"delete,omitempty"`
-	Merge  *Merge  `json:"merge,omitempty"`
+	ID           string        `json:"id,omitempty"`
+	Kind         string        `json:"kind"` // submit、spanEdit、delete、merge、follow、followAnswer、suspend
+	Submit       *Submit       `json:"submit,omitempty"`
+	SpanEdit     *SpanEdit     `json:"spanEdit,omitempty"`
+	Delete       *Delete       `json:"delete,omitempty"`
+	Merge        *Merge        `json:"merge,omitempty"`
+	Follow       *Follow       `json:"follow,omitempty"`
+	FollowAnswer *FollowAnswer `json:"followAnswer,omitempty"`
+	Suspend      *Suspend      `json:"suspend,omitempty"`
+}
+
+// ParseSpanEditOpts 把协议包转成领域参数；空字段/非法 ID 与领域校验一致。
+func ParseSpanEditOpts(s *SpanEdit) (document.SpanEditOpts, error) {
+	if s == nil {
+		return document.SpanEditOpts{}, fmt.Errorf("缺少 spanEdit")
+	}
+	if s.PersonID == "" {
+		return document.SpanEditOpts{}, fmt.Errorf("缺少 personId")
+	}
+	if len(s.BaseIDs) < 2 || len(s.BaseIDs) != len(s.BaseTexts) {
+		return document.SpanEditOpts{}, document.ErrSpanBase
+	}
+	if len(s.Replacement) == 0 {
+		return document.SpanEditOpts{}, document.ErrContent
+	}
+	want := 0
+	if len(s.Replacement) > 1 {
+		want = len(s.Replacement) - 1
+	}
+	if len(s.LineIDs) != want {
+		return document.SpanEditOpts{}, document.ErrLineIDs
+	}
+	opts := document.SpanEditOpts{
+		BaseTexts:   append([]string(nil), s.BaseTexts...),
+		Replacement: append([]string(nil), s.Replacement...),
+	}
+	opts.BaseIDs = make([]model.ID, len(s.BaseIDs))
+	seen := map[model.ID]bool{}
+	for i, raw := range s.BaseIDs {
+		if raw == "" {
+			return document.SpanEditOpts{}, document.ErrSpanBase
+		}
+		id, err := model.ParseID(raw)
+		if err != nil || id.IsZero() || seen[id] {
+			return document.SpanEditOpts{}, document.ErrSpanBase
+		}
+		seen[id] = true
+		opts.BaseIDs[i] = id
+	}
+	after, err := model.ParseID(s.AfterSeen)
+	if err != nil {
+		return document.SpanEditOpts{}, document.ErrSpanBase
+	}
+	opts.AfterSeen = after
+	if want > 0 {
+		opts.LineIDs = make([]model.ID, want)
+		for i, raw := range s.LineIDs {
+			if raw == "" {
+				return document.SpanEditOpts{}, document.ErrLineIDs
+			}
+			id, err := model.ParseID(raw)
+			if err != nil || id.IsZero() || seen[id] {
+				return document.SpanEditOpts{}, document.ErrLineIDs
+			}
+			seen[id] = true
+			opts.LineIDs[i] = id
+		}
+	}
+	return opts, nil
 }
 
 type Batch struct {
