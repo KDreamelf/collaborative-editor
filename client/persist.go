@@ -116,6 +116,9 @@ func (a *App) loadPersist() {
 	}
 }
 
+const msgSaveWarning = "暂时无法保存到本机，正在重试。请保持窗口打开。"
+const saveRetryDelay = time.Second
+
 // savePersistLocked 原子写盘。失败返回错误，调用方不得当成功。
 func (a *App) savePersistLocked() error {
 	if a.sessions == nil {
@@ -165,6 +168,60 @@ func (a *App) savePersistLocked() error {
 	return nil
 }
 
+// persistAfterMutationLocked 写盘；失败保留内存 queue/Doc，发 saveWarning 并后台重试。
+func (a *App) persistAfterMutationLocked() {
+	if err := a.savePersistLocked(); err != nil {
+		a.notePersistFailLocked()
+		return
+	}
+	a.clearSaveWarningLocked()
+}
+
+func (a *App) notePersistFailLocked() {
+	a.saveWarning = msgSaveWarning
+	a.emitSaveWarningLocked()
+	a.scheduleSaveRetryLocked()
+}
+
+func (a *App) emitSaveWarningLocked() {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "saveWarning", a.saveWarning)
+}
+
+func (a *App) clearSaveWarningLocked() {
+	if a.saveRetryTimer != nil {
+		a.saveRetryTimer.Stop()
+		a.saveRetryTimer = nil
+	}
+	if a.saveWarning == "" {
+		return
+	}
+	a.saveWarning = ""
+	a.emitSaveWarningLocked()
+}
+
+func (a *App) scheduleSaveRetryLocked() {
+	if a.saveRetryTimer != nil {
+		return
+	}
+	a.saveRetryTimer = time.AfterFunc(saveRetryDelay, func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.saveRetryTimer = nil
+		if err := a.savePersistLocked(); err != nil {
+			a.scheduleSaveRetryLocked()
+			return
+		}
+		a.clearSaveWarningLocked()
+		// ack 写盘失败曾清 sent；恢复后无需新输入即可继续发待确认队列。
+		if a.conn != nil && a.sentCount == 0 && len(a.queue) > 0 {
+			a.forceFlushLocked()
+		}
+	})
+}
+
 func (a *App) stashSessionLocked() {
 	if a.articleID == "" {
 		return
@@ -202,6 +259,7 @@ func (a *App) restoreSessionLocked(articleID string) {
 		a.sentCount = 0
 		a.sentSeq = 0
 		a.afterSeen = nil
+		a.beforeSeen = nil
 		a.lineBase = nil
 		return
 	}
@@ -220,6 +278,7 @@ func (a *App) restoreSessionLocked(articleID string) {
 	a.serverSnap = nil
 	a.doc = nil
 	a.afterSeen = nil
+	a.beforeSeen = nil
 	a.lineBase = nil
 	if sess.Snapshot != nil {
 		cp := *sess.Snapshot
@@ -239,9 +298,7 @@ func (a *App) restoreSessionLocked(articleID string) {
 			a.doc = doc
 			a.people = cp.People
 			a.cursors = cp.Cursors
-			for _, op := range a.queue {
-				_ = a.applyOpLocked(op)
-			}
+			a.replayQueueLocked()
 		}
 	}
 	if a.doc == nil {
@@ -318,17 +375,6 @@ func (a *App) cachedArticleLocked() *CachedArticle {
 	}
 }
 
-// ensurePersistOK 本地操作后写盘；失败则撤回刚入队的一步并报错。
-func (a *App) ensurePersistAfterPushLocked() error {
-	if err := a.savePersistLocked(); err != nil {
-		if len(a.queue) > 0 {
-			a.queue = a.queue[:len(a.queue)-1]
-		}
-		return fmt.Errorf("本地保存失败，请检查磁盘后重试")
-	}
-	return nil
-}
-
 func newRejected(op protocol.Op, msg string) rejectedOp {
 	id := op.ID
 	if id == "" {
@@ -342,14 +388,18 @@ func newRejected(op protocol.Op, msg string) rejectedOp {
 	}
 }
 
-// 本地领域拒绝跨度时给前端的稳定文案；KNOWN 白名单同源。
+// 本地领域拒绝时给前端的稳定文案；KNOWN 白名单同源。
 const msgLocalSpanReject = "这次修改暂时无法应用，内容已保存在未同步修改中"
 
-func spanRejectBaseKey(op protocol.Op) string {
-	if op.SpanEdit == nil {
-		return ""
+// localRejectKey 同目标草稿去重：跨度按 BaseIDs，普通提交按 LineID+Action。
+func localRejectKey(op protocol.Op) string {
+	if op.SpanEdit != nil {
+		return "span\x00" + strings.Join(op.SpanEdit.BaseIDs, "\x00")
 	}
-	return strings.Join(op.SpanEdit.BaseIDs, "\x00")
+	if op.Submit != nil {
+		return "submit\x00" + op.Submit.LineID + "\x00" + op.Submit.Action
+	}
+	return ""
 }
 
 // spanRejectDraftOp 仅 rejected 草稿：起止 ID + Replacement，不入队不执行。
@@ -366,7 +416,7 @@ func spanRejectDraftOp(personID, startID, endID string, replacement []string) pr
 	}
 }
 
-// saveLocalSpanRejectLocked 写入 rejected；成功返回稳定自然文案，落盘失败回磁盘错误。
+// saveLocalSpanRejectLocked 写入 rejected；成功返回稳定自然文案。
 func (a *App) saveLocalSpanRejectLocked(op protocol.Op) error {
 	if err := a.storeLocalSpanRejectLocked(op); err != nil {
 		return err
@@ -374,14 +424,13 @@ func (a *App) saveLocalSpanRejectLocked(op protocol.Op) error {
 	return fmt.Errorf("%s", msgLocalSpanReject)
 }
 
-// storeLocalSpanRejectLocked 正式 doc/队列不动；同 BaseIDs 覆盖旧草稿，避免连打堆叠。
+// storeLocalSpanRejectLocked 正式 doc/队列不动；同目标覆盖旧草稿，避免连打堆叠。
 func (a *App) storeLocalSpanRejectLocked(op protocol.Op) error {
-	oldRejected := append([]rejectedOp(nil), a.rejected...)
-	key := spanRejectBaseKey(op)
+	key := localRejectKey(op)
 	updated := false
 	if key != "" {
 		for i := range a.rejected {
-			if spanRejectBaseKey(a.rejected[i].Op) == key {
+			if localRejectKey(a.rejected[i].Op) == key {
 				id := a.rejected[i].ID
 				r := newRejected(op, msgLocalSpanReject)
 				if id != "" {
@@ -396,10 +445,43 @@ func (a *App) storeLocalSpanRejectLocked(op protocol.Op) error {
 	if !updated {
 		a.rejected = append(a.rejected, newRejected(op, msgLocalSpanReject))
 	}
-	if err := a.savePersistLocked(); err != nil {
-		a.rejected = oldRejected
-		return fmt.Errorf("本地保存失败，请检查磁盘后重试")
-	}
+	a.persistAfterMutationLocked()
 	a.emitUnsyncedLocked()
 	return nil
+}
+
+// upsertRejectedByOpIDLocked 按 OpID 覆盖未同步原文（本地重放失败 / 服务端拒绝）。
+func (a *App) upsertRejectedByOpIDLocked(op protocol.Op, msg string) {
+	if op.ID == "" {
+		op.ID = model.NewID().Hex()
+	}
+	for i := range a.rejected {
+		if a.rejected[i].Op.ID == op.ID || a.rejected[i].ID == op.ID {
+			keep := a.rejected[i].ID
+			r := newRejected(op, msg)
+			if keep != "" {
+				r.ID = keep
+			}
+			a.rejected[i] = r
+			return
+		}
+	}
+	a.rejected = append(a.rejected, newRejected(op, msg))
+}
+
+func (a *App) removeRejectedByOpIDLocked(opID string) bool {
+	if opID == "" {
+		return false
+	}
+	out := a.rejected[:0]
+	removed := false
+	for _, r := range a.rejected {
+		if r.Op.ID == opID || r.ID == opID {
+			removed = true
+			continue
+		}
+		out = append(out, r)
+	}
+	a.rejected = out
+	return removed
 }

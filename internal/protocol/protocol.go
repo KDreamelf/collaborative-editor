@@ -35,12 +35,16 @@ type Person struct {
 }
 
 type Cursor struct {
-	PersonID  string `json:"personId"`
-	Name      string `json:"name"`
-	LineID    string `json:"lineId"`
-	DisputeID string `json:"disputeId,omitempty"`
-	Offset    int    `json:"offset"`
-	SelEnd    int    `json:"selEnd"`
+	PersonID        string `json:"personId"`
+	Name            string `json:"name"`
+	LineID          string `json:"lineId"`
+	DisputeID       string `json:"disputeId,omitempty"`
+	Offset          int    `json:"offset"`
+	SelEnd          int    `json:"selEnd"`
+	PartIndex       int    `json:"partIndex,omitempty"`
+	SelEndLineID    string `json:"selEndLineId,omitempty"`
+	SelEndDisputeID string `json:"selEndDisputeId,omitempty"`
+	SelEndPartIndex int    `json:"selEndPartIndex,omitempty"`
 }
 
 type Join struct {
@@ -53,8 +57,10 @@ type Join struct {
 // Submit 是一份主张。
 // AfterSeen：客户端最后已应用的服务端快照里，锚点当时的后继 ID。
 // nil=字段缺失（兼容旧包）；非 nil 且空串=已知末尾。乐观本地改动不能写进这个基准。
+// BeforeSeen：快照里该行当时的前驱 ID。「插在前面」用；nil=旧包；非 nil 且空串=已知文首。
 // BaseContent：改这行时，快照里该行当时的正式内容。nil=旧包；非 nil（含空串）=已知基准。
-// LineIDs：客户端预生的新正式行 ID。插在后面时与 Content 等长；改这行多行粘贴时对应 Content[1:]。
+// LineIDs：客户端预生的新正式行 ID。插在后面/前面时与 Content 等长；改这行多行粘贴时对应 Content[1:]。
+// WholeClaim：false/缺省=普通正式行编辑；true=明确更新本人整份候选。
 type Submit struct {
 	Type        string   `json:"type"`
 	PersonID    string   `json:"personId"`
@@ -63,8 +69,10 @@ type Submit struct {
 	Content     []string `json:"content"`
 	ClientTs    int64    `json:"clientTs"`
 	AfterSeen   *string  `json:"afterSeen,omitempty"`
+	BeforeSeen  *string  `json:"beforeSeen,omitempty"`
 	BaseContent *string  `json:"baseContent,omitempty"`
 	LineIDs     []string `json:"lineIds,omitempty"`
+	WholeClaim  bool     `json:"wholeClaim,omitempty"`
 }
 
 // SpanEdit 跨多条正式行的一次整段替换。独立 kind，旧服务端遇未知 kind 会拒绝，避免误当单行粘贴。

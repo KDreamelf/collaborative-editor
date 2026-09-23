@@ -1631,8 +1631,8 @@ func TestCollidingLineIDsNoSideEffects(t *testing.T) {
 	if live == nil || live.person != "甲" {
 		t.Fatalf("不得归档甲的 live")
 	}
-	if len(d.insertHistory[anchor]) != 0 {
-		t.Fatalf("不得写入 insertHistory: %d", len(d.insertHistory[anchor]))
+	if len(d.insertHistory[claimKey{anchor, model.ActionInsert}]) != 0 {
+		t.Fatalf("不得写入 insertHistory: %d", len(d.insertHistory[claimKey{anchor, model.ActionInsert}]))
 	}
 }
 
@@ -1884,8 +1884,8 @@ func TestOriginRoundTripStackedDispute(t *testing.T) {
 	if again.Lines[3].InsertOrigin == nil || again.Lines[3].InsertOrigin.Person != "甲" {
 		t.Fatalf("旧段段首来源: %+v", again.Lines[3])
 	}
-	if len(loaded.insertHistory[anchor]) != 2 {
-		t.Fatalf("两段应进 history: %d", len(loaded.insertHistory[anchor]))
+	if len(loaded.insertHistory[claimKey{anchor, model.ActionInsert}]) != 2 {
+		t.Fatalf("两段应进 history: %d", len(loaded.insertHistory[claimKey{anchor, model.ActionInsert}]))
 	}
 	if err := loaded.SubmitWith("丁", anchor, model.ActionInsert, []string{"D1"}, SubmitOpts{
 		AfterSeen: idPtr(tail),

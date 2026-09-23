@@ -12,6 +12,10 @@ export function DismissUnsynced(arg1:string):Promise<void>;
 
 export function GetCachedArticle():Promise<main.CachedArticle>;
 
+export function GetSaveWarning():Promise<string>;
+
+export function GetServer():Promise<string>;
+
 export function Join(arg1:string,arg2:string):Promise<void>;
 
 export function ListArticles():Promise<Array<main.ArticleBrief>>;
@@ -21,6 +25,8 @@ export function ListUnsynced():Promise<Array<main.UnsyncedItem>>;
 export function MergeUp(arg1:string):Promise<void>;
 
 export function MoveCaret(arg1:string,arg2:string,arg3:number,arg4:number):Promise<void>;
+
+export function MoveCaretRange(arg1:string,arg2:string,arg3:number,arg4:number,arg5:string,arg6:string,arg7:number,arg8:number):Promise<void>;
 
 export function PersonID():Promise<string>;
 
@@ -32,7 +38,11 @@ export function SetServer(arg1:string):Promise<void>;
 
 export function SubmitEdit(arg1:string,arg2:string):Promise<void>;
 
+export function SubmitEditClaim(arg1:string,arg2:Array<string>):Promise<void>;
+
 export function SubmitInsert(arg1:string,arg2:Array<string>):Promise<void>;
+
+export function SubmitInsertBefore(arg1:string,arg2:Array<string>):Promise<void>;
 
 export function SubmitPaste(arg1:string,arg2:Array<string>):Promise<void>;
 

@@ -1,14 +1,43 @@
-import type { Text } from '@codemirror/state'
-import { ACTION_DELETE, ACTION_INSERT, type VisualRow } from './types'
+import type { ChangeSet, Text } from '@codemirror/state'
+import { ACTION_DELETE, ACTION_INSERT, ACTION_INSERT_BEFORE, isInsertAction, type VisualRow } from './types'
 
 /** CM doc = 各 VisualRow.content 用换行拼成；逻辑行号 0-based ↔ rows[i] */
 export function rowsToDoc(rows: VisualRow[]): string {
   return rows.map((r) => r.content ?? '').join('\n')
 }
 
+/** 光标标识带主张内的行下标；插入上下文仍引用正式锚点。 */
+export function cursorRowIndex(rows: VisualRow[], lineId: string, disputeId = '', partIndex = 0, personId = ''): number {
+  const index = rows.findIndex((r) => r.lineId === lineId && !r.isContext &&
+    r.disputeId === disputeId && r.partIndex === partIndex)
+  if (index >= 0 || disputeId) return index
+  const context = rows.findIndex((r) => r.isContext && r.lineId === lineId && r.personId === personId)
+  return context >= 0 ? context : rows.findIndex((r) => r.isContext && r.lineId === lineId && r.isSelf)
+}
+
+/** 只同步实际变化的片段，保留未受影响文字上的本地撤销历史。 */
+export function textChange(before: string, after: string): { from: number; to: number; insert: string } {
+  let from = 0
+  while (from < before.length && from < after.length && before[from] === after[from]) from++
+  let to = before.length
+  let end = after.length
+  while (to > from && end > from && before[to - 1] === after[end - 1]) { to--; end-- }
+  return { from, to, insert: after.slice(from, end) }
+}
+
+/** 使用原生操作坐标；相邻空行或重复文字不能靠文本差异猜锚点。 */
+export function changedRange(changes: ChangeSet, newDoc: Text): { from: number; to: number; insert: string } {
+  let from = Infinity
+  let to = 0
+  changes.iterChangedRanges((start, end) => { from = Math.min(from, start); to = Math.max(to, end) })
+  if (from === Infinity) return { from: 0, to: 0, insert: '' }
+  return { from, to, insert: newDoc.sliceString(changes.mapPos(from, -1), changes.mapPos(to, 1)) }
+}
+
 /** 同一正式行或同一份多行主张视为一个可写单元 */
 export function unitKey(row: VisualRow): string {
   if (row.disputeId) return `d:${row.disputeId}`
+  if (isInsertAction(row.action)) return `insert:${row.action}:${row.lineId}`
   // phantom / 乐观跨度：无 disputeId，靠 spanBaseIDs 成组
   if (row.spanBaseIDs && row.spanBaseIDs.length >= 2) {
     return `s:${row.spanBaseIDs[0]}`
@@ -26,7 +55,7 @@ export function isPlainFormalRow(row: VisualRow | undefined): boolean {
     !row.disputeId &&
     !row.phantom &&
     !row.spanBaseIDs?.length &&
-    row.action !== ACTION_INSERT &&
+    !isInsertAction(row.action) &&
     row.action !== ACTION_DELETE &&
     row.partCount === 1 &&
     row.partIndex === 0
@@ -124,8 +153,19 @@ export function posFromKeyOffset(
   rows: VisualRow[],
   key: string,
   offset: number,
+  previous?: VisualRow,
 ): number {
-  const idx = rows.findIndex((r) => r.key === key)
+  let idx = rows.findIndex((r) => r.key === key)
+  // 乐观候选入链后换了正式 ID，按原锚点和段内位置恢复，而非跳到全文开头。
+  if (idx < 0 && previous) {
+    idx = rows.findIndex((r) => r.isSelf && r.lineId === previous.lineId &&
+      r.action === previous.action && !r.isContext && r.partIndex === 0)
+    if (idx < 0 && isInsertAction(previous.action)) {
+      const anchor = rows.findIndex((r) => r.isSelf && r.lineId === previous.lineId)
+      if (anchor >= 0) idx = previous.action === ACTION_INSERT_BEFORE ? Math.max(0, anchor - previous.partCount) : anchor + 1
+    }
+    if (idx >= 0) idx += previous.partIndex
+  }
   if (idx < 0) {
     return Math.min(offset, doc.length)
   }

@@ -4,9 +4,10 @@ package model
 // BSON 字段用中文，和库里的原始数据一致。JSON 用英文，给页面和管理后台。
 
 const (
-	ActionEdit   = "改这行"
-	ActionInsert = "插在后面"
-	ActionDelete = "删这行"
+	ActionEdit         = "改这行"
+	ActionInsert       = "插在后面"
+	ActionInsertBefore = "插在前面"
+	ActionDelete       = "删这行"
 )
 
 type Article struct {
@@ -26,11 +27,14 @@ type Line struct {
 	EditOrigin   *EditOrigin    `bson:"编辑来源,omitempty" json:"editOrigin,omitempty"`
 }
 
-// InsertOrigin 挂在插入段首行：谁插入、锚在哪、原先后继、段内行、最初整段。
+// InsertOrigin 挂在插入段首行：谁插入、锚在哪、方向、原边界、段内行、最初整段。
+// Action 空或「插在后面」= 锚后插入（看 OldNext）；「插在前面」= 锚前插入（看 OldPrev）。
 type InsertOrigin struct {
 	Person  string   `bson:"插入者" json:"inserter"`
 	Anchor  ID       `bson:"锚点" json:"anchor"`
-	OldNext ID       `bson:"原后继,omitempty" json:"oldNext"`
+	Action  string   `bson:"做法,omitempty" json:"action,omitempty"`
+	OldNext ID       `bson:"原后继,omitempty" json:"oldNext,omitempty"`
+	OldPrev ID       `bson:"原前驱,omitempty" json:"oldPrev,omitempty"`
 	LineIDs []ID     `bson:"段内行" json:"lineIDs"`
 	Content []string `bson:"最初内容" json:"originalContent"`
 }
@@ -61,6 +65,7 @@ type PendingConfirm struct {
 
 // Dispute 不进链。同一条正式行上，每人一份，真实行相同。
 // 内容是一组字符串：改一行就是一项，一次粘贴的多行都在这一份里。
+// 「插在前面」真实行=下方原行；Content 仅插入段。
 // BaseIDs 非空时表示跨度整段「改这行」：追随收口要按原跨度替换；旧单行争议该字段为空。
 type Dispute struct {
 	ID        ID               `bson:"_id" json:"id"`
@@ -71,4 +76,17 @@ type Dispute struct {
 	BaseIDs   []ID             `bson:"基准行,omitempty" json:"baseIDs,omitempty"`
 	Followers []string         `bson:"追随者" json:"followers"`
 	Pending   []PendingConfirm `bson:"待确认" json:"pendingConfirm"`
+}
+
+// InsertAction 归一插入做法：空视为「插在后面」。
+func InsertAction(action string) string {
+	if action == "" || action == ActionInsert {
+		return ActionInsert
+	}
+	return action
+}
+
+// IsInsertAction 是否插入类做法（后面/前面）。
+func IsInsertAction(action string) bool {
+	return action == ActionInsert || action == ActionInsertBefore
 }

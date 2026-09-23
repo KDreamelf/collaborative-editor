@@ -27,13 +27,18 @@ type wsClient struct {
 	name     string
 }
 
+const wsWriteWait = 5 * time.Second
+
 func (c *wsClient) send(data []byte) {
 	if c == nil || c.conn == nil {
 		return
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	_ = c.conn.WriteMessage(websocket.TextMessage, data)
+	_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		_ = c.conn.Close()
+	}
 }
 
 type room struct {
@@ -52,11 +57,11 @@ type Hub struct {
 	mu       sync.Mutex
 	rooms    map[string]*room
 	order    []string
-	mongo    *mongoStore
+	mongo    articleStore
 	upgrader websocket.Upgrader
 }
 
-func NewHub(store *mongoStore) *Hub {
+func NewHub(store articleStore) *Hub {
 	h := &Hub{
 		rooms: make(map[string]*room),
 		mongo: store,
@@ -65,12 +70,17 @@ func NewHub(store *mongoStore) *Hub {
 		},
 	}
 	if store != nil {
-		h.loadAll()
+		h.loadMissing()
 	}
 	return h
 }
 
-func (h *Hub) loadAll() {
+// loadMissing 从库补尚未在内存的文章。只添加，不覆盖已打开/已改房间。
+// list/load 失败留给下轮；读失败不当成空集合。网络 I/O 不持全局锁。
+func (h *Hub) loadMissing() {
+	if h.mongo == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ids, err := h.mongo.listIDs(ctx)
@@ -78,19 +88,47 @@ func (h *Hub) loadAll() {
 		log.Printf("mongo list: %v", err)
 		return
 	}
+	h.mu.Lock()
+	need := make([]string, 0, len(ids))
 	for _, id := range ids {
+		if _, ok := h.rooms[id]; !ok {
+			need = append(need, id)
+		}
+	}
+	h.mu.Unlock()
+
+	type loaded struct {
+		id  string
+		doc *document.Doc
+	}
+	var batch []loaded
+	for _, id := range need {
 		doc, err := h.mongo.load(ctx, id)
 		if err != nil {
-			log.Printf("mongo load %s: %v", id, err)
+			if err != mongo.ErrNoDocuments {
+				log.Printf("mongo load %s: %v", id, err)
+			}
 			continue
 		}
-		h.rooms[id] = &room{
-			doc:     doc,
+		batch = append(batch, loaded{id, doc})
+	}
+	if len(batch) == 0 {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, p := range batch {
+		if _, ok := h.rooms[p.id]; ok {
+			continue
+		}
+		h.rooms[p.id] = &room{
+			doc:     p.doc,
 			names:   map[string]string{},
 			clients: map[*wsClient]struct{}{},
 			cursors: map[string]protocol.Cursor{},
 		}
-		h.order = append(h.order, id)
+		h.order = append(h.order, p.id)
 	}
 }
 
@@ -105,6 +143,7 @@ func (h *Hub) StartFlush(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
+			h.loadMissing()
 			h.flushDirty()
 		}
 	}
@@ -470,13 +509,20 @@ func (r *room) applyBatchOp(client *wsClient, op protocol.Op) ([]outbound, error
 		if err != nil {
 			return nil, err
 		}
-		opts := document.SubmitOpts{}
+		opts := document.SubmitOpts{WholeClaim: op.Submit.WholeClaim}
 		if op.Submit.AfterSeen != nil {
 			seen, err := model.ParseID(*op.Submit.AfterSeen)
 			if err != nil {
 				return nil, err
 			}
 			opts.AfterSeen = &seen
+		}
+		if op.Submit.BeforeSeen != nil {
+			seen, err := model.ParseID(*op.Submit.BeforeSeen)
+			if err != nil {
+				return nil, err
+			}
+			opts.BeforeSeen = &seen
 		}
 		if op.Submit.BaseContent != nil {
 			cp := *op.Submit.BaseContent

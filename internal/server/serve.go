@@ -12,7 +12,10 @@ func Main() {
 	uri := env("MONGO_URI", "mongodb://127.0.0.1:27017")
 	dbName := env("MONGO_DB", "editor")
 
-	store := connectMongo(uri, dbName)
+	var store articleStore
+	if s := connectMongo(uri, dbName); s != nil {
+		store = s
+	}
 	hub := NewHub(store)
 	stop := make(chan struct{})
 	go hub.StartFlush(stop)
@@ -60,7 +63,10 @@ func (h *Hub) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Title string `json:"title"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "坏请求", http.StatusBadRequest)
+		return
+	}
 	meta := h.CreateArticle(body.Title)
 	writeJSON(w, http.StatusOK, meta)
 }

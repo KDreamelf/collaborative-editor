@@ -25,9 +25,7 @@ func (a *App) pushOpLocked(op protocol.Op) error {
 	}
 	a.queue = append(a.queue, op)
 	a.lastEnqAt = now
-	if err := a.ensurePersistAfterPushLocked(); err != nil {
-		return err
-	}
+	a.persistAfterMutationLocked()
 	a.armFlushLocked()
 	return nil
 }
@@ -164,10 +162,13 @@ func (a *App) connect() error {
 		_ = a.conn.Close()
 		a.conn = nil
 	}
+	a.connGen++
+	myGen := a.connGen
 	ws, err := a.wsURL()
 	articleID := a.articleID
 	personID := a.personID
 	name := a.name
+	handshakeTO := a.requestTimeout()
 	a.mu.Unlock()
 	if err != nil {
 		a.mu.Lock()
@@ -176,11 +177,17 @@ func (a *App) connect() error {
 		return fmt.Errorf("无法连接服务器")
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(ws, nil)
+	dialer := websocket.Dialer{HandshakeTimeout: handshakeTO}
+	conn, _, err := dialer.Dial(ws, nil)
 	a.mu.Lock()
 	a.dialing = false
 	if err != nil {
 		a.mu.Unlock()
+		return fmt.Errorf("无法连接服务器")
+	}
+	if a.connGen != myGen {
+		a.mu.Unlock()
+		_ = conn.Close()
 		return fmt.Errorf("无法连接服务器")
 	}
 	a.conn = conn
@@ -200,9 +207,9 @@ func (a *App) connect() error {
 		return err
 	}
 	a.joined = true
-	a.emitOfflineLocked(false)
+	// 仅在收到有效 snapshot 后才 emit offline=false，避免假在线。
 	a.mu.Unlock()
-	go a.readLoop(conn)
+	go a.readLoop(conn, myGen)
 	return nil
 }
 
@@ -233,19 +240,21 @@ func (a *App) reconnectLater() {
 	}
 }
 
-func (a *App) readLoop(conn *websocket.Conn) {
+func (a *App) readLoop(conn *websocket.Conn, gen uint64) {
 	defer func() {
 		a.mu.Lock()
-		if a.conn == conn {
+		mine := a.conn == conn && a.connGen == gen
+		if mine {
 			a.conn = nil
 			a.sentCount = 0
 			a.sentSeq = 0
+			a.emitOfflineLocked(true)
 		}
 		articleID := a.articleID
 		joined := a.joined
 		a.mu.Unlock()
 		_ = conn.Close()
-		if articleID != "" && joined {
+		if mine && articleID != "" && joined {
 			go a.reconnectLater()
 		}
 	}()
@@ -255,11 +264,11 @@ func (a *App) readLoop(conn *websocket.Conn) {
 		if err != nil {
 			return
 		}
-		a.handleMessage(data)
+		a.handleMessage(data, gen)
 	}
 }
 
-func (a *App) handleMessage(data []byte) {
+func (a *App) handleMessage(data []byte, gen uint64) {
 	var head struct {
 		Type string `json:"type"`
 	}
@@ -272,7 +281,7 @@ func (a *App) handleMessage(data []byte) {
 		if err := json.Unmarshal(data, &snap); err != nil {
 			return
 		}
-		a.onSnapshot(snap)
+		a.onSnapshot(snap, gen)
 	case protocol.TypeCursors:
 		var msg struct {
 			Cursors []protocol.Cursor `json:"cursors"`
@@ -281,6 +290,10 @@ func (a *App) handleMessage(data []byte) {
 			return
 		}
 		a.mu.Lock()
+		if a.connGen != gen {
+			a.mu.Unlock()
+			return
+		}
 		a.cursors = msg.Cursors
 		a.mu.Unlock()
 		if a.ctx != nil {
@@ -291,12 +304,24 @@ func (a *App) handleMessage(data []byte) {
 		if err := json.Unmarshal(data, &ask); err != nil {
 			return
 		}
+		a.mu.Lock()
+		ok := a.connGen == gen
+		a.mu.Unlock()
+		if !ok {
+			return
+		}
 		if a.ctx != nil {
 			runtime.EventsEmit(a.ctx, "followAsk", ask)
 		}
 	case protocol.TypeFollowResult:
 		var res protocol.FollowResult
 		if err := json.Unmarshal(data, &res); err != nil {
+			return
+		}
+		a.mu.Lock()
+		ok := a.connGen == gen
+		a.mu.Unlock()
+		if !ok {
 			return
 		}
 		if a.ctx != nil {
@@ -307,10 +332,16 @@ func (a *App) handleMessage(data []byte) {
 		if err := json.Unmarshal(data, &ack); err != nil {
 			return
 		}
-		a.onAck(ack)
+		a.onAck(ack, gen)
 	case protocol.TypeError:
 		var em protocol.ErrMsg
 		if err := json.Unmarshal(data, &em); err != nil {
+			return
+		}
+		a.mu.Lock()
+		ok := a.connGen == gen
+		a.mu.Unlock()
+		if !ok {
 			return
 		}
 		if a.ctx != nil {
@@ -319,27 +350,42 @@ func (a *App) handleMessage(data []byte) {
 	}
 }
 
-func (a *App) onAck(ack protocol.Ack) {
+func (a *App) onAck(ack protocol.Ack, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.connGen != gen {
+		return
+	}
 	if ack.Seq != a.sentSeq || a.sentCount == 0 {
+		return
+	}
+	// Applied 只覆盖本批 in-flight；负数 panic，>sentCount 会误丢后续未发送条目。
+	if ack.Applied < 0 || ack.Applied > a.sentCount {
 		return
 	}
 	oldQueue := append([]protocol.Op(nil), a.queue...)
 	oldRejected := append([]rejectedOp(nil), a.rejected...)
 
-	drop := ack.Applied
+	appliedN := ack.Applied
+	applied := append([]protocol.Op(nil), a.queue[:appliedN]...)
+	drop := appliedN
 	rejectedNow := false
-	if ack.Message != "" && drop < len(a.queue) {
-		failed := a.queue[drop]
-		a.rejected = append(a.rejected, newRejected(failed, ack.Message))
+	var failed *protocol.Op
+	// Message 只对应已发送但未 Applied 的那一笔；Applied==sentCount 时无失败槽，忽略孤儿 Message，勿误拒后续未发送项。
+	if ack.Message != "" && drop < a.sentCount {
+		f := a.queue[drop]
+		failed = &f
 		drop++
 		rejectedNow = true
 	}
-	if drop > len(a.queue) {
-		drop = len(a.queue)
-	}
 	a.queue = append([]protocol.Op(nil), a.queue[drop:]...)
+	// 成功送达的 Op：清掉仅因本地重放失败留下的误判草稿。
+	for _, op := range applied {
+		_ = a.removeRejectedByOpIDLocked(op.ID)
+	}
+	if failed != nil {
+		a.upsertRejectedByOpIDLocked(*failed, ack.Message)
+	}
 	a.sentCount = 0
 	a.sentSeq = 0
 	if len(a.queue) > 0 {
@@ -349,23 +395,24 @@ func (a *App) onAck(ack protocol.Ack) {
 		a.oldestAt = time.Time{}
 	}
 	if err := a.savePersistLocked(); err != nil {
-		// 回退队列/拒绝列表；清 sent（本次 ack 已消费）。不立刻重发，等重连或后续入队。
+		// 回退队列/拒绝列表；清 sent。保留内存原文，saveWarning 重试，不诱发前端回滚。
 		a.queue = oldQueue
 		a.rejected = oldRejected
 		a.sentCount = 0
 		a.sentSeq = 0
 		a.oldestAt = time.Now()
 		a.lastEnqAt = a.oldestAt
-		if a.ctx != nil {
-			runtime.EventsEmit(a.ctx, "error", "本地保存失败，请检查磁盘后重试")
-		}
+		a.notePersistFailLocked()
 		return
 	}
+	a.clearSaveWarningLocked()
 	if rejectedNow {
 		a.emitUnsyncedLocked()
 		if a.ctx != nil {
 			runtime.EventsEmit(a.ctx, "error", "有一处修改未能同步到服务器，原文已保存在本地")
 		}
+	} else if len(applied) > 0 {
+		a.emitUnsyncedLocked()
 	}
 	if len(a.deferred) > 0 {
 		a.drainDeferredLocked()
@@ -376,9 +423,12 @@ func (a *App) onAck(ack protocol.Ack) {
 	}
 }
 
-func (a *App) onSnapshot(snap protocol.Snapshot) {
+func (a *App) onSnapshot(snap protocol.Snapshot, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.connGen != gen {
+		return
+	}
 	doc, err := document.Load(snap.Article, snap.Lines, snap.Disputes)
 	if err != nil {
 		if a.ctx != nil {
@@ -401,10 +451,9 @@ func (a *App) onSnapshot(snap protocol.Snapshot) {
 	a.doc = doc
 	a.people = snap.People
 	a.cursors = snap.Cursors
-	for _, op := range a.queue {
-		_ = a.applyOpLocked(op)
-	}
-	_ = a.savePersistLocked()
+	a.replayQueueLocked()
+	a.persistAfterMutationLocked()
+	a.emitOfflineLocked(false)
 	a.emitSnapshotLocked()
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "cursors", a.cursors)
@@ -412,6 +461,28 @@ func (a *App) onSnapshot(snap protocol.Snapshot) {
 	// 断线重连后重发未确认队列
 	if a.conn != nil && a.sentCount == 0 && len(a.queue) > 0 {
 		a.forceFlushLocked()
+	}
+}
+
+// replayQueueLocked 重放待送 Op。本地失败只留可复制草稿（按 OpID 去重），不剥队列；
+// 送达以服务端 ack 为准，避免 sentCount 与队列错位。
+func (a *App) replayQueueLocked() {
+	if len(a.queue) == 0 {
+		return
+	}
+	changed := false
+	for _, op := range a.queue {
+		if err := a.applyOpLocked(op); err != nil {
+			a.upsertRejectedByOpIDLocked(op, "本地无法重放该修改，原文已保存在未同步修改中")
+			changed = true
+			continue
+		}
+		if a.removeRejectedByOpIDLocked(op.ID) {
+			changed = true
+		}
+	}
+	if changed {
+		a.emitUnsyncedLocked()
 	}
 }
 
@@ -440,13 +511,20 @@ func (a *App) applyOpLocked(op protocol.Op) error {
 		if err != nil {
 			return err
 		}
-		opts := document.SubmitOpts{}
+		opts := document.SubmitOpts{WholeClaim: s.WholeClaim}
 		if s.AfterSeen != nil {
 			seen, err := model.ParseID(*s.AfterSeen)
 			if err != nil {
 				return err
 			}
 			opts.AfterSeen = &seen
+		}
+		if s.BeforeSeen != nil {
+			seen, err := model.ParseID(*s.BeforeSeen)
+			if err != nil {
+				return err
+			}
+			opts.BeforeSeen = &seen
 		}
 		if s.BaseContent != nil {
 			cp := *s.BaseContent

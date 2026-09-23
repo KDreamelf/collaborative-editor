@@ -683,6 +683,118 @@ func TestSpanEditBatchOneOp(t *testing.T) {
 	}
 }
 
+func TestInsertBeforeDisputeAnchorIsOriginalLine(t *testing.T) {
+	h := NewHub(nil)
+	meta := h.CreateArticle("t")
+	r := h.getRoom(meta.ID)
+	h.join(r, &wsClient{}, "p1", "甲")
+	h.join(r, &wsClient{}, "p2", "乙")
+	v, _ := h.GetView(meta.ID)
+	if len(v.Lines) < 2 {
+		_ = r.doc.EnsureLines(2)
+		v, _ = h.GetView(meta.ID)
+	}
+	l1, l2 := v.Lines[0].ID, v.Lines[1].ID
+	idA, idB := model.NewID(), model.NewID()
+	before := l1.Hex()
+	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
+		ID:   "before-a",
+		Kind: protocol.TypeSubmit,
+		Submit: &protocol.Submit{
+			PersonID:   "p1",
+			LineID:     l2.Hex(),
+			Action:     model.ActionInsertBefore,
+			Content:    []string{"甲前"},
+			BeforeSeen: &before,
+			LineIDs:    []string{idA.Hex()},
+		},
+	}}})
+	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
+		ID:   "before-b",
+		Kind: protocol.TypeSubmit,
+		Submit: &protocol.Submit{
+			PersonID:   "p2",
+			LineID:     l2.Hex(),
+			Action:     model.ActionInsertBefore,
+			Content:    []string{"乙前"},
+			BeforeSeen: &before,
+			LineIDs:    []string{idB.Hex()},
+		},
+	}}})
+	after, err := h.GetView(meta.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, d := range after.Disputes {
+		if d.Action != model.ActionInsertBefore {
+			continue
+		}
+		found++
+		if d.RealLine != l2 {
+			t.Fatalf("before 争议 anchor 须为下方原行: got %s want %s action=%s content=%v",
+				d.RealLine.Hex(), l2.Hex(), d.Action, d.Content)
+		}
+		if len(d.Content) != 1 || (d.Content[0] != "甲前" && d.Content[0] != "乙前") {
+			t.Fatalf("Content 仅插入段: %+v", d)
+		}
+	}
+	if found < 2 {
+		t.Fatalf("应有两份插在前面争议: disputes=%+v lines=%+v", after.Disputes, after.Lines)
+	}
+}
+
+func TestInsertAfterStillWorksWithBeforeSeenField(t *testing.T) {
+	h := NewHub(nil)
+	meta := h.CreateArticle("t")
+	r := h.getRoom(meta.ID)
+	h.join(r, &wsClient{}, "p1", "甲")
+	v, _ := h.GetView(meta.ID)
+	if len(v.Lines) < 2 {
+		_ = r.doc.EnsureLines(2)
+		v, _ = h.GetView(meta.ID)
+	}
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+	newID := model.NewID()
+	afterSeen := tail.Hex()
+	msgs := h.applyBatch(r, &wsClient{}, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
+		ID:   "after-1",
+		Kind: protocol.TypeSubmit,
+		Submit: &protocol.Submit{
+			PersonID:  "p1",
+			LineID:    anchor.Hex(),
+			Action:    model.ActionInsert,
+			Content:   []string{"后插"},
+			AfterSeen: &afterSeen,
+			LineIDs:   []string{newID.Hex()},
+		},
+	}}})
+	acked := false
+	for _, m := range msgs {
+		var head struct {
+			Type    string `json:"type"`
+			Applied int    `json:"applied"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(m.data, &head); err != nil {
+			continue
+		}
+		if head.Type == protocol.TypeAck {
+			acked = true
+			if head.Applied != 1 || head.Message != "" {
+				t.Fatalf("旧 after 应成功: %+v", head)
+			}
+		}
+	}
+	if !acked {
+		t.Fatal("应有 Ack")
+	}
+	after, _ := h.GetView(meta.ID)
+	if len(after.Lines) < 3 || after.Lines[1].ID != newID || after.Lines[1].Content != "后插" {
+		t.Fatalf("旧 after 入链: %+v", after.Lines)
+	}
+}
+
 func TestSpanEditUnknownKindRejected(t *testing.T) {
 	h := NewHub(nil)
 	meta := h.CreateArticle("t")

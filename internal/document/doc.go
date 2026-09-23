@@ -10,7 +10,7 @@ import (
 var (
 	ErrHead          = errors.New("正式行里没有「前」的那条不唯一，首行不确定")
 	ErrBroken        = errors.New("正式行的链断了，或者残段没删干净")
-	ErrAction        = errors.New("做法只能是改这行、插在后面或删这行")
+	ErrAction        = errors.New("做法只能是改这行、插在后面、插在前面或删这行")
 	ErrContent       = errors.New("主张没有内容")
 	ErrLine          = errors.New("没有这条正式行")
 	ErrNotEmpty      = errors.New("非空行不能直接删除")
@@ -36,7 +36,7 @@ type Doc struct {
 	disputes      map[model.ID]*model.Dispute
 	suspended     map[model.ID]bool
 	live          map[claimKey]*liveClaim
-	insertHistory map[model.ID][]*liveClaim // 每锚点已入链的插入，旧→新；live 只留最新段
+	insertHistory map[claimKey][]*liveClaim // 每锚点+方向已入链插入，旧→新；live 只留最新段
 	pending       []followPend
 }
 
@@ -47,12 +47,14 @@ type claimKey struct {
 
 // liveClaim 是还没撞上的那一笔。撞上之后收回，改成争议文档。
 // ids 记录这次 splice 进链的正式行，收回时只拆这些，不误伤叠在上面的别人的段。
+// oldNext：插在后面时的原后继；oldPrev：插在前面时的原前驱。
 // baseIDs/baseTexts 非空表示跨度整段替换：收回时按原跨度恢复，首行 ID 稳定。
 type liveClaim struct {
 	person    string
 	content   []string
 	before    string
 	oldNext   model.ID
+	oldPrev   model.ID
 	spliced   bool
 	ids       []model.ID
 	baseIDs   []model.ID
@@ -60,12 +62,17 @@ type liveClaim struct {
 }
 
 // SubmitOpts 是 Submit 的可选扩展。零值保持旧调用语义。
-// AfterSeen：nil=未提供；非 nil（含零值 ID）=客户端快照里看见的锚点后继。
+// AfterSeen：nil=未提供；非 nil（含零值 ID）=客户端快照里看见的锚点后继（仅插在后面）。
+// BeforeSeen：nil=旧包；非 nil（含零值 ID）=客户端快照里看见的锚点前驱（仅插在前面；零 ID=已知文首）。
 // BaseContent：nil=旧包；非 nil（含空串）=改这行时客户端快照里的正式行内容。
+// WholeClaim：false=普通正式行编辑/粘贴（只改头，新行插在头与原后继之间，保留已有尾）；
+// true=明确更新本人整份候选（含多行缩成一行）。
 type SubmitOpts struct {
 	AfterSeen   *model.ID
+	BeforeSeen  *model.ID
 	BaseContent *string
 	LineIDs     []model.ID
+	WholeClaim  bool
 }
 
 // SpanEditOpts 跨多条正式行的一次替换/粘贴/删除，一份整段主张。
@@ -105,7 +112,7 @@ func New(title string) *Doc {
 		disputes:      map[model.ID]*model.Dispute{},
 		suspended:     map[model.ID]bool{},
 		live:          map[claimKey]*liveClaim{},
-		insertHistory: map[model.ID][]*liveClaim{},
+		insertHistory: map[claimKey][]*liveClaim{},
 	}
 	return d
 }
@@ -117,7 +124,7 @@ func Load(article model.Article, lines []model.Line, disputes []model.Dispute) (
 		disputes:      make(map[model.ID]*model.Dispute, len(disputes)),
 		suspended:     map[model.ID]bool{},
 		live:          map[claimKey]*liveClaim{},
-		insertHistory: map[model.ID][]*liveClaim{},
+		insertHistory: map[claimKey][]*liveClaim{},
 	}
 	for i := range lines {
 		ln := lines[i]
@@ -270,19 +277,48 @@ func (d *Doc) line(id model.ID) (*model.Line, error) {
 }
 
 // splice 把一段接到 anchor 和原来的后一行之间。
-// 新行的前后在出生时写好。旧行只改两处：anchor 的后，原来后一行的前。
-// 段尾的前仍是段里的上一行。ids 为空则服务端自生；非空则用客户端预生 ID。
 func (d *Doc) splice(anchor model.ID, texts []string) ([]model.ID, error) {
 	return d.spliceIDs(anchor, texts, nil)
 }
 
 func (d *Doc) spliceIDs(anchor model.ID, texts []string, ids []model.ID) ([]model.ID, error) {
-	if len(texts) == 0 {
-		return nil, ErrContent
-	}
 	base, err := d.line(anchor)
 	if err != nil {
 		return nil, err
+	}
+	return d.spliceBetween(anchor, base.Next, texts, ids)
+}
+
+// spliceBetween 把 texts 插在 left 与 right 之间。left 为零表示文首（right 须为当前首行）。
+// ids 为空则服务端自生；非空则用客户端预生 ID。不造哨兵正式行。
+func (d *Doc) spliceBetween(left, right model.ID, texts []string, ids []model.ID) ([]model.ID, error) {
+	if len(texts) == 0 {
+		return nil, ErrContent
+	}
+	if left.IsZero() {
+		if right.IsZero() {
+			return nil, ErrBroken
+		}
+		head, err := d.line(right)
+		if err != nil {
+			return nil, err
+		}
+		if !head.Prev.IsZero() {
+			return nil, ErrBroken
+		}
+	} else {
+		base, err := d.line(left)
+		if err != nil {
+			return nil, err
+		}
+		if base.Next != right {
+			return nil, ErrBroken
+		}
+		if !right.IsZero() {
+			if n := d.lines[right]; n == nil || n.Prev != left {
+				return nil, ErrBroken
+			}
+		}
 	}
 	if len(ids) == 0 {
 		ids = make([]model.ID, len(texts))
@@ -301,32 +337,33 @@ func (d *Doc) spliceIDs(anchor model.ID, texts []string, ids []model.ID) ([]mode
 			seen[id] = true
 		}
 	}
-	oldNext := base.Next
-	prev := anchor
+	prev := left
 	for i, text := range texts {
 		id := ids[i]
 		ln := &model.Line{ID: id, Prev: prev, Content: text}
 		d.lines[id] = ln
-		d.lines[prev].Next = id
+		if !prev.IsZero() {
+			d.lines[prev].Next = id
+		}
 		prev = id
 	}
 	tail := d.lines[prev]
-	tail.Next = oldNext
-	if !oldNext.IsZero() {
-		d.lines[oldNext].Prev = tail.ID
+	tail.Next = right
+	if !right.IsZero() {
+		d.lines[right].Prev = tail.ID
 	}
 	return ids, nil
 }
 
-func (d *Doc) archiveLiveInsert(anchor model.ID, live *liveClaim) {
+func (d *Doc) archiveLiveInsert(key claimKey, live *liveClaim) {
 	if live == nil {
 		return
 	}
 	cp := cloneLive(live)
 	if d.insertHistory == nil {
-		d.insertHistory = map[model.ID][]*liveClaim{}
+		d.insertHistory = map[claimKey][]*liveClaim{}
 	}
-	d.insertHistory[anchor] = append(d.insertHistory[anchor], cp)
+	d.insertHistory[key] = append(d.insertHistory[key], cp)
 }
 
 func copyLine(ln model.Line) model.Line {
@@ -361,6 +398,7 @@ func cloneLive(live *liveClaim) *liveClaim {
 		content:   append([]string(nil), live.content...),
 		before:    live.before,
 		oldNext:   live.oldNext,
+		oldPrev:   live.oldPrev,
 		spliced:   live.spliced,
 		ids:       append([]model.ID(nil), live.ids...),
 		baseIDs:   append([]model.ID(nil), live.baseIDs...),
@@ -368,7 +406,8 @@ func cloneLive(live *liveClaim) *liveClaim {
 	}
 }
 
-func (d *Doc) setInsertOrigin(ids []model.ID, person string, anchor, oldNext model.ID, content []string) {
+// setInsertOrigin 写入段首出处。action 空/插在后面用 oldNext；插在前面用 oldPrev。
+func (d *Doc) setInsertOrigin(ids []model.ID, person string, anchor model.ID, action string, oldPrev, oldNext model.ID, content []string) {
 	if len(ids) == 0 {
 		return
 	}
@@ -376,13 +415,20 @@ func (d *Doc) setInsertOrigin(ids []model.ID, person string, anchor, oldNext mod
 	if head == nil {
 		return
 	}
-	head.InsertOrigin = &model.InsertOrigin{
+	action = model.InsertAction(action)
+	origin := &model.InsertOrigin{
 		Person:  person,
 		Anchor:  anchor,
-		OldNext: oldNext,
 		LineIDs: append([]model.ID(nil), ids...),
 		Content: append([]string(nil), content...),
 	}
+	if action == model.ActionInsertBefore {
+		origin.Action = model.ActionInsertBefore
+		origin.OldPrev = oldPrev
+	} else {
+		origin.OldNext = oldNext
+	}
+	head.InsertOrigin = origin
 	for _, id := range ids[1:] {
 		if ln := d.lines[id]; ln != nil {
 			ln.InsertOrigin = nil
@@ -446,12 +492,12 @@ func (d *Doc) clearEditOrigin(ids []model.ID) {
 }
 
 // rebuildFromOrigins：从正式行上来源字段恢复 insertHistory 与编辑 live。
-// 已入链插入一律进 history（旧→新）；与现网判断兼容。旧行无字段则跳过。
+// 已入链插入一律进 history（旧→新）；按锚点+方向分桶。旧行无字段则跳过。
 func (d *Doc) rebuildFromOrigins() error {
 	type seg struct {
-		anchor model.ID
-		dist   int
-		live   *liveClaim
+		key  claimKey
+		dist int
+		live *liveClaim
 	}
 	var segs []seg
 	for _, ln := range d.lines {
@@ -462,17 +508,18 @@ func (d *Doc) rebuildFromOrigins() error {
 		if err != nil {
 			return err
 		}
-		segs = append(segs, seg{anchor: ln.InsertOrigin.Anchor, dist: dist, live: claim})
+		action := model.InsertAction(ln.InsertOrigin.Action)
+		segs = append(segs, seg{key: claimKey{ln.InsertOrigin.Anchor, action}, dist: dist, live: claim})
 	}
-	byAnchor := map[model.ID][]seg{}
+	byKey := map[claimKey][]seg{}
 	for _, s := range segs {
-		byAnchor[s.anchor] = append(byAnchor[s.anchor], s)
+		byKey[s.key] = append(byKey[s.key], s)
 	}
-	for anchor, list := range byAnchor {
+	for key, list := range byKey {
 		slices.SortFunc(list, func(a, b seg) int { return a.dist - b.dist })
 		// dist 小=靠近锚点=较新；history 要旧→新，故倒序写入。
 		for i := len(list) - 1; i >= 0; i-- {
-			d.insertHistory[anchor] = append(d.insertHistory[anchor], list[i].live)
+			d.insertHistory[key] = append(d.insertHistory[key], list[i].live)
 		}
 	}
 	for id, ln := range d.lines {
@@ -582,14 +629,34 @@ func (d *Doc) parseInsertOrigin(ln *model.Line) (*liveClaim, int, error) {
 			return nil, 0, ErrBroken
 		}
 	}
-	last := d.lines[o.LineIDs[len(o.LineIDs)-1]]
-	if last.Next != o.OldNext {
-		return nil, 0, ErrBroken
+	action := model.InsertAction(o.Action)
+	first, last := d.lines[o.LineIDs[0]], d.lines[o.LineIDs[len(o.LineIDs)-1]]
+	// 段端与当前邻接双向自洽；历史 OldPrev/OldNext 只要求沿链可达（可夹另一方向段）。
+	if err := checkEndsLinked(first, last, d); err != nil {
+		return nil, 0, err
 	}
-	if !o.OldNext.IsZero() {
-		if n := d.lines[o.OldNext]; n == nil || n.Prev != last.ID {
+	if action == model.ActionInsertBefore {
+		if !boundaryAlongPrev(d, first.ID, o.OldPrev) {
 			return nil, 0, ErrBroken
 		}
+		// 锚点沿「前」走到段尾；堆叠后旧段 Next 不再等于锚点。
+		dist := distAlongPrev(d, o.Anchor, last.ID)
+		if dist < 1 {
+			return nil, 0, ErrBroken
+		}
+		return &liveClaim{
+			person:  o.Person,
+			content: append([]string(nil), o.Content...),
+			oldPrev: o.OldPrev,
+			spliced: true,
+			ids:     append([]model.ID(nil), o.LineIDs...),
+		}, dist, nil
+	}
+	if first.Prev.IsZero() {
+		return nil, 0, ErrBroken
+	}
+	if !boundaryAlongNext(d, last.ID, o.OldNext) {
+		return nil, 0, ErrBroken
 	}
 	// 同步堆叠后旧段段首 Prev 不再等于锚点；只需锚点沿链能走到段首。
 	dist := distAlong(d, o.Anchor, ln.ID)
@@ -619,6 +686,129 @@ func distAlong(d *Doc, anchor, target model.ID) int {
 		}
 		seen[ln.Next] = true
 		id = ln.Next
+	}
+	return -1
+}
+
+// distAlongPrev：从 anchor 沿「前」走到 target 的步数；不可达返回 -1。
+func distAlongPrev(d *Doc, anchor, target model.ID) int {
+	seen := map[model.ID]bool{}
+	id := anchor
+	for steps := 0; steps <= len(d.lines); steps++ {
+		if id == target {
+			return steps
+		}
+		ln := d.lines[id]
+		if ln == nil || ln.Prev.IsZero() || seen[ln.Prev] {
+			return -1
+		}
+		seen[ln.Prev] = true
+		id = ln.Prev
+	}
+	return -1
+}
+
+// checkEndsLinked：段首 Prev、段尾 Next 与邻接行双向指针自洽（邻接可为另一方向插入）。
+func checkEndsLinked(first, last *model.Line, d *Doc) error {
+	if first == nil || last == nil {
+		return ErrBroken
+	}
+	if !first.Prev.IsZero() {
+		p := d.lines[first.Prev]
+		if p == nil || p.Next != first.ID {
+			return ErrBroken
+		}
+	}
+	if !last.Next.IsZero() {
+		n := d.lines[last.Next]
+		if n == nil || n.Prev != last.ID {
+			return ErrBroken
+		}
+	}
+	return nil
+}
+
+// boundaryAlongNext：从 from 沿 Next 可达 oldNext；零值=文末。每步校验双向指针。
+// 非零边界须严格在 from 之后（步数≥1）。
+func boundaryAlongNext(d *Doc, from, oldNext model.ID) bool {
+	steps := alongNextTo(d, from, oldNext)
+	if steps < 0 {
+		return false
+	}
+	if oldNext.IsZero() {
+		return true
+	}
+	return steps >= 1
+}
+
+// boundaryAlongPrev：从 from 沿 Prev 可达 oldPrev；零值=文首。每步校验双向指针。
+func boundaryAlongPrev(d *Doc, from, oldPrev model.ID) bool {
+	steps := alongPrevTo(d, from, oldPrev)
+	if steps < 0 {
+		return false
+	}
+	if oldPrev.IsZero() {
+		return true
+	}
+	return steps >= 1
+}
+
+// alongNextTo：沿 Next 走到 to（零=文末）；双向断裂或环返回 -1。
+func alongNextTo(d *Doc, from, to model.ID) int {
+	seen := map[model.ID]bool{}
+	id := from
+	for steps := 0; steps <= len(d.lines); steps++ {
+		ln := d.lines[id]
+		if ln == nil {
+			return -1
+		}
+		if to.IsZero() {
+			if ln.Next.IsZero() {
+				return steps
+			}
+		} else if id == to {
+			return steps
+		}
+		next := ln.Next
+		if next.IsZero() || seen[next] {
+			return -1
+		}
+		n := d.lines[next]
+		if n == nil || n.Prev != id {
+			return -1
+		}
+		seen[next] = true
+		id = next
+	}
+	return -1
+}
+
+// alongPrevTo：沿 Prev 走到 to（零=文首）；双向断裂或环返回 -1。
+func alongPrevTo(d *Doc, from, to model.ID) int {
+	seen := map[model.ID]bool{}
+	id := from
+	for steps := 0; steps <= len(d.lines); steps++ {
+		ln := d.lines[id]
+		if ln == nil {
+			return -1
+		}
+		if to.IsZero() {
+			if ln.Prev.IsZero() {
+				return steps
+			}
+		} else if id == to {
+			return steps
+		}
+		prev := ln.Prev
+		if prev.IsZero() || seen[prev] {
+			return -1
+		}
+		p := d.lines[prev]
+		if p == nil || p.Next != id {
+			return -1
+		}
+		seen[prev] = true
+		id = prev
 	}
 	return -1
 }
@@ -672,14 +862,18 @@ func (d *Doc) checkNewLineIDs(ids []model.ID) error {
 	return nil
 }
 
-// checkSegmentUnlink：只读预检，与 unlinkSegment 成功条件一致。
-// 同步堆叠后旧段 Prev 不是锚点，只要求邻接指针与 oldNext 自洽。
-func (d *Doc) checkSegmentUnlink(anchor model.ID, seg *liveClaim) error {
+// checkSegmentUnlink：只读预检，与 unlinkSegment 成功条件一致——只按自身 ids 拆。
+// 历史 oldNext/oldPrev 须沿链可达（可夹另一方向段），不要求仍是当前紧邻。
+func (d *Doc) checkSegmentUnlink(anchor model.ID, seg *liveClaim, action string) error {
 	if seg == nil || !seg.spliced {
 		return nil
 	}
+	action = model.InsertAction(action)
 	ids := seg.ids
 	if len(ids) == 0 {
+		if action == model.ActionInsertBefore {
+			return ErrBroken
+		}
 		if _, err := d.between(anchor, seg.oldNext); err != nil {
 			return err
 		}
@@ -698,19 +892,20 @@ func (d *Doc) checkSegmentUnlink(anchor model.ID, seg *liveClaim) error {
 		}
 	}
 	first, last := d.lines[ids[0]], d.lines[ids[len(ids)-1]]
-	if last.Next != seg.oldNext {
-		return ErrBroken
+	if err := checkEndsLinked(first, last, d); err != nil {
+		return err
+	}
+	if action == model.ActionInsertBefore {
+		if !boundaryAlongPrev(d, first.ID, seg.oldPrev) {
+			return ErrBroken
+		}
+		return nil
 	}
 	if first.Prev.IsZero() {
 		return ErrBroken
 	}
-	if p := d.lines[first.Prev]; p == nil || p.Next != first.ID {
+	if !boundaryAlongNext(d, last.ID, seg.oldNext) {
 		return ErrBroken
-	}
-	if !last.Next.IsZero() {
-		if n := d.lines[last.Next]; n == nil || n.Prev != last.ID {
-			return ErrBroken
-		}
 	}
 	return nil
 }
@@ -733,6 +928,14 @@ func (d *Doc) unlinkSegment(ids []model.ID) error {
 	}
 	first, last := d.lines[ids[0]], d.lines[ids[len(ids)-1]]
 	prev, next := first.Prev, last.Next
+	deleted := make(map[model.ID]bool, len(ids))
+	for _, id := range ids {
+		deleted[id] = true
+	}
+	// 被删段邻接已知；保留段若 Old* 指入被删 ID，先检查再重接到外侧存活邻接。
+	if err := d.planRetargetDanglingBounds(deleted, prev, next); err != nil {
+		return err
+	}
 	if !prev.IsZero() {
 		if p := d.lines[prev]; p != nil {
 			p.Next = next
@@ -747,10 +950,64 @@ func (d *Doc) unlinkSegment(ids []model.ID) error {
 		delete(d.lines, id)
 		d.clearLineClaims(id)
 	}
+	d.applyRetargetDanglingBounds(deleted, prev, next)
 	return nil
 }
 
-// sameDisputeSlot：同一真实行上，「改这行」与「删这行」同一场争议；「插在后面」独立。
+// planRetargetDanglingBounds：只读。外侧重接目标须已在链上且不在被删集合；不接受凭空 ID。
+// BaseIDs 是历史基准，不在此改写。
+func (d *Doc) planRetargetDanglingBounds(deleted map[model.ID]bool, outerPrev, outerNext model.ID) error {
+	if !outerPrev.IsZero() && (deleted[outerPrev] || d.lines[outerPrev] == nil) {
+		return ErrBroken
+	}
+	if !outerNext.IsZero() && (deleted[outerNext] || d.lines[outerNext] == nil) {
+		return ErrBroken
+	}
+	return nil
+}
+
+// applyRetargetDanglingBounds：把指入被删段的 InsertOrigin/EditOrigin.Old* 与 live/history 边界重接到外侧。
+func (d *Doc) applyRetargetDanglingBounds(deleted map[model.ID]bool, outerPrev, outerNext model.ID) {
+	for id, ln := range d.lines {
+		if deleted[id] || ln == nil {
+			continue
+		}
+		if o := ln.InsertOrigin; o != nil {
+			if deleted[o.OldPrev] {
+				o.OldPrev = outerPrev
+			}
+			if deleted[o.OldNext] {
+				o.OldNext = outerNext
+			}
+		}
+		if o := ln.EditOrigin; o != nil {
+			if deleted[o.OldNext] {
+				o.OldNext = outerNext
+			}
+		}
+	}
+	retargetLiveBound := func(live *liveClaim) {
+		if live == nil {
+			return
+		}
+		if deleted[live.oldPrev] {
+			live.oldPrev = outerPrev
+		}
+		if deleted[live.oldNext] {
+			live.oldNext = outerNext
+		}
+	}
+	for _, live := range d.live {
+		retargetLiveBound(live)
+	}
+	for _, hist := range d.insertHistory {
+		for _, live := range hist {
+			retargetLiveBound(live)
+		}
+	}
+}
+
+// sameDisputeSlot：同一真实行上，「改这行」与「删这行」同一场争议；插前/插后各自独立。
 func sameDisputeSlot(a, b string) bool {
 	if a == b {
 		return true
@@ -763,7 +1020,22 @@ func lineBodyAction(a string) bool {
 }
 
 func (d *Doc) hasLiveInsert(line model.ID) bool {
-	return d.live[claimKey{line, model.ActionInsert}] != nil
+	return d.live[claimKey{line, model.ActionInsert}] != nil ||
+		d.live[claimKey{line, model.ActionInsertBefore}] != nil
+}
+
+func (d *Doc) hasInsertHistory(line model.ID) bool {
+	return len(d.insertHistory[claimKey{line, model.ActionInsert}]) > 0 ||
+		len(d.insertHistory[claimKey{line, model.ActionInsertBefore}]) > 0
+}
+
+func (d *Doc) hasInsertDisputes(line model.ID) bool {
+	return len(d.group(line, model.ActionInsert)) > 0 ||
+		len(d.group(line, model.ActionInsertBefore)) > 0
+}
+
+func (d *Doc) hasInsertClaims(line model.ID) bool {
+	return d.hasLiveInsert(line) || d.hasInsertDisputes(line)
 }
 
 // blocksMergeLive：同锚点有 live 插入，或别人的 live 编辑时，合并会清掉它们。
@@ -772,7 +1044,7 @@ func (d *Doc) blocksMergeLive(line model.ID, self string) bool {
 		if key.line != line {
 			continue
 		}
-		if key.action == model.ActionInsert {
+		if model.IsInsertAction(key.action) {
 			return true
 		}
 		if live != nil && live.person != self {

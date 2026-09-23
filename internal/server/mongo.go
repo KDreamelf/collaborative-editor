@@ -12,6 +12,13 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+// articleStore 进程内文章落盘；mongoStore 实现。测试可注入假实现。
+type articleStore interface {
+	listIDs(ctx context.Context) ([]string, error)
+	load(ctx context.Context, idHex string) (*document.Doc, error)
+	save(ctx context.Context, v document.View) error
+}
+
 type mongoStore struct {
 	client *mongo.Client
 	db     *mongo.Database
@@ -25,12 +32,12 @@ func connectMongo(uri, dbName string) *mongoStore {
 		log.Printf("mongo connect: %v", err)
 		return nil
 	}
+	store := &mongoStore{client: client, db: client.Database(dbName)}
 	if err := client.Ping(ctx, nil); err != nil {
-		log.Printf("mongo ping: %v", err)
-		_ = client.Disconnect(context.Background())
-		return nil
+		// Connect 已成功则保留 client，交给 driver 后续重连；勿 Disconnect。
+		log.Printf("mongo ping: %v (暂不可用，稍后重试读写)", err)
 	}
-	return &mongoStore{client: client, db: client.Database(dbName)}
+	return store
 }
 
 func (s *mongoStore) listIDs(ctx context.Context) ([]string, error) {

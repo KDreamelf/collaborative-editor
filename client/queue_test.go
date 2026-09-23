@@ -62,6 +62,60 @@ func TestJoinFailDoesNotMarkJoined(t *testing.T) {
 	}
 }
 
+func TestHTTPDoTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.serverURL = srv.URL
+	app.httpTimeout = 50 * time.Millisecond
+	start := time.Now()
+	_, err := app.ListArticles()
+	elapsed := time.Since(start)
+	if err == nil || err.Error() != "无法连接服务器" {
+		t.Fatalf("应超时: %v", err)
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("超时过慢: %v", elapsed)
+	}
+}
+
+func TestConnectHandshakeTimeoutClearsDialing(t *testing.T) {
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hang
+	}))
+	t.Cleanup(func() {
+		close(hang)
+		srv.Close()
+	})
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.serverURL = srv.URL
+	app.httpTimeout = 50 * time.Millisecond
+	app.articleID = "art"
+	app.name = "甲"
+	start := time.Now()
+	err := app.connect()
+	elapsed := time.Since(start)
+	if err == nil || err.Error() != "无法连接服务器" {
+		t.Fatalf("握手超时: %v", err)
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("超时过慢: %v", elapsed)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if app.dialing {
+		t.Fatal("超时后 dialing 须清，避免永久 busy")
+	}
+	if app.conn != nil {
+		t.Fatal("超时不得留下 conn")
+	}
+}
+
 func TestOfflineFollowStaysInQueueInEditOrder(t *testing.T) {
 	doc, target := twoPersonDoc(t, "p1")
 	app := NewAppWithStateDir(t.TempDir())
@@ -146,6 +200,10 @@ func TestReconnectRetriesUntilUp(t *testing.T) {
 
 func TestReconnectResendsFollowBatch(t *testing.T) {
 	doc, target := twoPersonDoc(t, "p1")
+	v0, _ := doc.View()
+	followArt := v0.Article
+	followLines := append([]model.Line(nil), v0.Lines...)
+	followDisputes := append([]model.Dispute(nil), v0.Disputes...)
 	got := make(chan protocol.Batch, 1)
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -158,12 +216,12 @@ func TestReconnectResendsFollowBatch(t *testing.T) {
 		if err != nil {
 			return
 		}
-		lineID := model.NewID()
 		snap := protocol.Snapshot{
 			Type: protocol.TypeSnapshot,
 			View: document.View{
-				Article: model.Article{ID: model.NewID(), Title: "t"},
-				Lines:   []model.Line{{ID: lineID}},
+				Article:  followArt,
+				Lines:    followLines,
+				Disputes: followDisputes,
 			},
 		}
 		if err := c.WriteJSON(snap); err != nil {
@@ -615,3 +673,199 @@ func TestSpanEditOfflineRestore(t *testing.T) {
 		t.Fatalf("opPlainText: %q", text)
 	}
 }
+
+func TestSubmitEditClaimSetsWholeClaim(t *testing.T) {
+	doc := document.New("t")
+	v, _ := doc.View()
+	line := v.Lines[0].ID
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.articleID = "art"
+	app.doc = doc
+	app.rememberAfterSeenLocked(v.Lines)
+
+	if err := app.SubmitPaste(line.Hex(), []string{"P", "Q"}); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	if app.queue[0].Submit == nil || app.queue[0].Submit.WholeClaim {
+		app.mu.Unlock()
+		t.Fatalf("SubmitPaste 默认 WholeClaim=false: %+v", app.queue[0].Submit)
+	}
+	app.mu.Unlock()
+
+	if err := app.SubmitEdit(line.Hex(), "R"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := app.doc.View()
+	if len(after.Lines) != 2 || after.Lines[0].Content != "R" || after.Lines[1].Content != "Q" {
+		t.Fatalf("普通 Edit 保留尾: %+v", after.Lines)
+	}
+	app.mu.Lock()
+	if app.queue[1].Submit == nil || app.queue[1].Submit.WholeClaim {
+		app.mu.Unlock()
+		t.Fatalf("SubmitEdit 默认 WholeClaim=false: %+v", app.queue[1].Submit)
+	}
+	app.mu.Unlock()
+
+	if err := app.SubmitEditClaim(line.Hex(), []string{"R"}); err != nil {
+		t.Fatal(err)
+	}
+	sh, _ := app.doc.View()
+	if len(sh.Lines) != 1 || sh.Lines[0].Content != "R" {
+		t.Fatalf("WholeClaim 缩段删 Q: %+v", sh.Lines)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	s := app.queue[2].Submit
+	if s == nil || !s.WholeClaim {
+		t.Fatalf("SubmitEditClaim 须 WholeClaim=true: %+v", s)
+	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back protocol.Submit
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.WholeClaim {
+		t.Fatalf("JSON 往返丢 WholeClaim: %s", raw)
+	}
+}
+
+func TestApplyOpReplayWholeClaim(t *testing.T) {
+	doc := document.New("t")
+	v, _ := doc.View()
+	line := v.Lines[0].ID
+	qID := model.NewID()
+	if err := doc.SubmitWith("甲", line, model.ActionEdit, []string{"P", "Q"}, document.SubmitOpts{
+		BaseContent: strPtr(""),
+		LineIDs:     []model.ID{qID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.doc = doc
+	op := protocol.Op{
+		ID:   model.NewID().Hex(),
+		Kind: protocol.TypeSubmit,
+		Submit: &protocol.Submit{
+			Type:       protocol.TypeSubmit,
+			PersonID:   "甲",
+			LineID:     line.Hex(),
+			Action:     model.ActionEdit,
+			Content:    []string{"R"},
+			WholeClaim: true,
+			BaseContent: strPtr("P"),
+		},
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if err := app.applyOpLocked(op); err != nil {
+		t.Fatal(err)
+	}
+	after, err := app.doc.View()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Lines) != 1 || after.Lines[0].Content != "R" {
+		t.Fatalf("回放 WholeClaim 应删 Q: %+v", after.Lines)
+	}
+}
+
+func TestBeforeSeenFromServerSnapshotOnly(t *testing.T) {
+	doc := document.New("t")
+	if err := doc.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := doc.View()
+	l1, l2 := v.Lines[0].ID, v.Lines[1].ID
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.articleID = "art"
+	app.doc = doc
+	app.rememberAfterSeenLocked(v.Lines)
+
+	if err := app.SubmitInsertBefore(l2.Hex(), []string{"B1"}); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if app.beforeSeen[l2.Hex()] != l1.Hex() {
+		t.Fatalf("乐观插入不得改基准前驱: got %q want %q", app.beforeSeen[l2.Hex()], l1.Hex())
+	}
+	if len(app.queue) != 1 || app.queue[0].Submit == nil {
+		t.Fatal("应入队 submit")
+	}
+	s := app.queue[0].Submit
+	if s.Action != model.ActionInsertBefore {
+		t.Fatalf("Action: %q", s.Action)
+	}
+	if s.BeforeSeen == nil || *s.BeforeSeen != l1.Hex() {
+		t.Fatalf("BeforeSeen 应来自快照: %+v want %s", s.BeforeSeen, l1.Hex())
+	}
+	if s.AfterSeen != nil {
+		t.Fatalf("插在前面不得带 AfterSeen: %+v", s.AfterSeen)
+	}
+	if len(s.LineIDs) != 1 || s.LineIDs[0] == "" {
+		t.Fatalf("应预生 LineIDs: %+v", s.LineIDs)
+	}
+	if text := opPlainText(app.queue[0]); text != "B1" {
+		t.Fatalf("opPlainText 须识别 before 原文: %q", text)
+	}
+}
+
+func TestBeforeSeenDocStartEmptyString(t *testing.T) {
+	doc := document.New("t")
+	v, _ := doc.View()
+	head := v.Lines[0].ID
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.articleID = "art"
+	app.doc = doc
+	app.rememberAfterSeenLocked(v.Lines)
+
+	if err := app.SubmitInsertBefore(head.Hex(), []string{"HEAD"}); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	s := app.queue[0].Submit
+	if s == nil || s.BeforeSeen == nil || *s.BeforeSeen != "" {
+		t.Fatalf("文首 BeforeSeen 须非 nil 空串: %+v", s)
+	}
+}
+
+func TestAfterSeenStillFromServerSnapshot(t *testing.T) {
+	doc := document.New("t")
+	if err := doc.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := doc.View()
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.articleID = "art"
+	app.doc = doc
+	app.rememberAfterSeenLocked(v.Lines)
+
+	if err := app.SubmitInsert(anchor.Hex(), []string{"A1"}); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	s := app.queue[0].Submit
+	if s.AfterSeen == nil || *s.AfterSeen != tail.Hex() {
+		t.Fatalf("旧 after 不变: %+v", s.AfterSeen)
+	}
+	if s.BeforeSeen != nil {
+		t.Fatalf("插在后面不得带 BeforeSeen: %+v", s.BeforeSeen)
+	}
+}
+
+func strPtr(s string) *string { return &s }

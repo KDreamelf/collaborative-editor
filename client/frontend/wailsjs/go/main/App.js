@@ -22,6 +22,14 @@ export function GetCachedArticle() {
   return window['go']['main']['App']['GetCachedArticle']();
 }
 
+export function GetSaveWarning() {
+  return window['go']['main']['App']['GetSaveWarning']();
+}
+
+export function GetServer() {
+  return window['go']['main']['App']['GetServer']();
+}
+
 export function Join(arg1, arg2) {
   return window['go']['main']['App']['Join'](arg1, arg2);
 }
@@ -40,6 +48,10 @@ export function MergeUp(arg1) {
 
 export function MoveCaret(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['MoveCaret'](arg1, arg2, arg3, arg4);
+}
+
+export function MoveCaretRange(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
+  return window['go']['main']['App']['MoveCaretRange'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
 }
 
 export function PersonID() {
@@ -62,8 +74,16 @@ export function SubmitEdit(arg1, arg2) {
   return window['go']['main']['App']['SubmitEdit'](arg1, arg2);
 }
 
+export function SubmitEditClaim(arg1, arg2) {
+  return window['go']['main']['App']['SubmitEditClaim'](arg1, arg2);
+}
+
 export function SubmitInsert(arg1, arg2) {
   return window['go']['main']['App']['SubmitInsert'](arg1, arg2);
+}
+
+export function SubmitInsertBefore(arg1, arg2) {
+  return window['go']['main']['App']['SubmitInsertBefore'](arg1, arg2);
 }
 
 export function SubmitPaste(arg1, arg2) {

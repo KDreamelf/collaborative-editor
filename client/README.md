@@ -1,19 +1,34 @@
-# README
+# 桌面客户端
 
-## About
+在项目根目录运行服务端后，在本目录执行：
 
-This is the official Wails Vue-TS template.
+```powershell
+wails dev
+```
 
-You can configure the project by editing `wails.json`. More information about the project settings can be found
-here: https://wails.io/docs/reference/project-config
+客户端包含文档列表、新建与继续编辑、连接设置、连续编辑面、追随确认和未同步原文面板。主张、离线队列和本地保存由 Go 处理，Vue 负责显示与操作。
 
-## Live Development
+正式流程应通过桌面窗口或 Wails 开发服务打开。单独运行前端 Vite 不包含 Go 桥接。
 
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development
-server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser
-and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect
-to this in your browser, and you can call your Go code from devtools.
+## 布局演示
 
-## Building
+```powershell
+cd frontend
+npm install
+npm run dev -- --port 5175
+```
 
-To build a redistributable, production mode package, use `wails build`.
+访问 `http://127.0.0.1:5175/?mock=1` 查看插入争议布局；追加 `&span=1` 查看选区范围候选。演示数据只在开发模式载入，不包含真实同步、离线恢复或持久化。
+
+## 验证与打包
+
+```powershell
+go test ./...
+cd frontend
+npm run check:editor
+npm run build
+cd ..
+wails build
+```
+
+`check:editor` 验证选区替换、多行光标、插入上下文和局部文本同步。窗口切换、输入法、追随与离线恢复还需要真实客户端联调；mock 页面不能代替这些验证。

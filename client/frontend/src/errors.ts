@@ -8,7 +8,20 @@ const KNOWN = new Set([
   '本地保存失败，请检查磁盘后重试',
   '无法跨争议区或他人候选做整段修改',
   '这次修改暂时无法应用，内容已保存在未同步修改中',
+  '请先完成当前输入，再切换文档',
+  '复制失败，请选中原文手动复制',
+  '服务器地址不能为空',
+  '请输入有效的 http 或 https 地址',
+  '还有未发送或未同步的修改，请处理后再切换服务器',
 ])
+
+const ACTIONABLE: Record<string, string> = {
+  '没有这场争议': '这场争议已经结束，请查看最新内容',
+  '还有未决主张，不能合并': '这里还有未解决的主张，请先处理争议再合并',
+  '非空行不能直接删除': '请先选中要删除的文字',
+  '没有这条正式行': '这一行已发生变化，请查看最新内容',
+  '跨度内有未决插入、子争议或跨越锚点，不能整段替换': '这里还有未解决的主张，请先处理争议再调整行的结构',
+}
 
 const LOG_ID_RE = /E\d{8}-\d{6}-[0-9a-z]+/
 const LOG_ID_IN_MSG_RE = /日志编号\s+(E\d{8}-\d{6}-[0-9a-z]+)/
@@ -61,6 +74,7 @@ export function formatUserError(e: unknown): string {
     .replace(/^Error:\s*/i, '')
     .trim()
   if (KNOWN.has(msg)) return msg
+  if (ACTIONABLE[msg]) return ACTIONABLE[msg]
   const prior = existingLogId(msg)
   if (prior) {
     persistUnknown(prior, e)

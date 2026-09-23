@@ -1,14 +1,16 @@
 <script lang="ts" setup>
-import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
+import { defaultKeymap, history, redo, undo } from '@codemirror/commands'
 import {
   Annotation,
   EditorSelection,
   EditorState,
   StateEffect,
   StateField,
+  Transaction,
   type Extension,
   type Text,
   type TransactionSpec,
+  type StateCommand,
 } from '@codemirror/state'
 import {
   Decoration,
@@ -20,14 +22,17 @@ import {
   type ViewUpdate,
   WidgetType,
 } from '@codemirror/view'
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import ModalDialog from './ModalDialog.vue'
 import {
   DeleteLine,
   MergeUp,
-  MoveCaret,
+  MoveCaretRange,
   RequestFollow,
   SubmitEdit,
+  SubmitEditClaim,
   SubmitInsert,
+  SubmitInsertBefore,
   SubmitPaste,
   SubmitSpanEdit,
   Suspend,
@@ -36,12 +41,15 @@ import {
   buildSpanReplacement,
   caretAfterSpanInsert,
   caretPosInRows,
+  changedRange,
+  cursorRowIndex,
   isValidFormalSpan,
   keyOffsetFromPos,
   posFromKeyOffset,
   rowsToDoc,
   spanSelectionPrefix,
   touchedLineIndexes,
+  textChange,
   unitKey,
   unitLineIndices,
 } from '../projection'
@@ -49,15 +57,18 @@ import {
   ACTION_DELETE,
   ACTION_EDIT,
   ACTION_INSERT,
+  ACTION_INSERT_BEFORE,
   Cursor,
   VisualRow,
   colorFor,
+  isInsertAction,
 } from '../types'
 
 const props = defineProps<{
   rows: VisualRow[]
   me: string
   cursors: Cursor[]
+  initialLineId?: string
 }>()
 
 const emit = defineEmits<{
@@ -65,6 +76,8 @@ const emit = defineEmits<{
 }>()
 
 const host = ref<HTMLElement | null>(null)
+const followTarget = ref('')
+const following = ref(false)
 
 const syncAnn = Annotation.define<boolean>()
 const CROSS_MSG = '无法跨争议区或他人候选做整段修改'
@@ -95,14 +108,36 @@ let serverRows: VisualRow[] = []
 let cursorsRef: Cursor[] = []
 let meRef = ''
 let composing = false
-let pendingRows: VisualRow[] | null = null
+let deferredRows: VisualRow[] | null = null
 let focusKey = ''
 let suspendTimer: number | null = null
 let suspendedLocal = false
 let lastCaretKey = ''
 let lastCaretOff = 0
 let lastCaretEnd = 0
+let lastAnchorKey = ''
 let suppressSubmit = false
+let structuralCaret: { row: VisualRow; part: number; offset: number; insert: boolean; ready: boolean; minRows: number; text: string } | null = null
+const pendingSubmissions = new Set<Promise<void>>()
+
+function trackSubmit(promise: Promise<void>): Promise<void> {
+  pendingSubmissions.add(promise)
+  const settled = () => {
+    pendingSubmissions.delete(promise)
+    if (!pendingSubmissions.size) flushDeferredRows()
+  }
+  void promise.then(settled, settled)
+  return promise
+}
+
+function flushDeferredRows() {
+  requestAnimationFrame(() => {
+    if (!view || composing || pendingSubmissions.size || !deferredRows) return
+    const next = deferredRows
+    deferredRows = null
+    applyRows(next, true)
+  })
+}
 /** 串行 SubmitSpanEdit，连打不丢、不乱序 */
 let spanTail: Promise<void> = Promise.resolve()
 
@@ -117,7 +152,7 @@ function enqueueSpanEdit(
 ): Promise<void> {
   const run = spanTail.then(() => SubmitSpanEdit(startLineID, endLineID, replacement))
   spanTail = run.catch(() => {})
-  return run
+  return trackSubmit(run)
 }
 
 function buildOptimisticSpanRows(
@@ -164,7 +199,6 @@ function buildOptimisticSpanRows(
 /** 本地立刻折叠跨度行，再串行提交；CM doc 与 rowsRef 同步 */
 function applySpanLocally(
   doc: Text,
-  docLen: number,
   idxs: number[],
   fromA: number,
   toA: number,
@@ -181,36 +215,16 @@ function applySpanLocally(
   lastCaretEnd = caret.offset
   focusKey = lastCaretKey
   const base = next[idxs[0]].spanBaseIDs!
-  enqueueSpanEdit(base[0], base[base.length - 1], replacement).catch((e) => {
+  if (!composing) enqueueSpanEdit(base[0], base[base.length - 1], replacement).catch((e) => {
     showError(e)
     revertDoc()
   })
   return {
-    changes: { from: 0, to: docLen, insert: rowsToDoc(next) },
+    changes: textChange(doc.toString(), rowsToDoc(next)),
     selection: EditorSelection.cursor(caretPosInRows(next, partIdx, caret.offset)),
     annotations: syncAnn.of(true),
     effects: [setRowsEffect.of(next), setCursorsEffect.of(cursorsRef)],
   }
-}
-
-function commitSpanFromView(
-  v: EditorView,
-  idxs: number[],
-  fromA: number,
-  toA: number,
-  inserted: string,
-) {
-  const spec = applySpanLocally(
-    v.state.doc,
-    v.state.doc.length,
-    idxs,
-    fromA,
-    toA,
-    inserted,
-  )
-  suppressSubmit = true
-  v.dispatch(spec)
-  suppressSubmit = false
 }
 
 /** 已有跨度候选内改 parts：本地立刻换成完整整段，再 enqueue 一份 */
@@ -235,7 +249,7 @@ function commitSpanClaim(
   })
   suppressSubmit = true
   v.dispatch({
-    changes: { from: 0, to: v.state.doc.length, insert: rowsToDoc(next) },
+    changes: textChange(v.state.doc.toString(), rowsToDoc(next)),
     selection: EditorSelection.cursor(caretPosInRows(next, partIdx, caretOff)),
     annotations: syncAnn.of(true),
     effects: [setRowsEffect.of(next), setCursorsEffect.of(cursorsRef)],
@@ -259,7 +273,7 @@ function revertDoc() {
   suppressSubmit = true
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: want },
-    annotations: syncAnn.of(true),
+    annotations: [syncAnn.of(true), Transaction.addToHistory.of(false)],
     effects: [setRowsEffect.of(serverRows), setCursorsEffect.of(cursorsRef)],
   })
   suppressSubmit = false
@@ -278,7 +292,7 @@ function armSuspend(row: VisualRow) {
   suspendTimer = window.setTimeout(() => {
     if (focusKey !== row.key) return
     suspendedLocal = true
-    Suspend(row.lineId, row.action, true).catch(showError)
+    Suspend(row.lineId, attentionAction(row), true).catch(showError)
   }, 60_000)
 }
 
@@ -286,7 +300,7 @@ async function resumeSuspend(row: VisualRow) {
   if (suspendedLocal && row.isSelf) {
     suspendedLocal = false
     try {
-      await Suspend(row.lineId, row.action, false)
+      await Suspend(row.lineId, attentionAction(row), false)
     } catch (e) {
       showError(e)
     }
@@ -299,26 +313,32 @@ async function blurSuspend(row: VisualRow) {
   if (row.isSelf && !suspendedLocal) {
     suspendedLocal = true
     try {
-      await Suspend(row.lineId, row.action, true)
+      await Suspend(row.lineId, attentionAction(row), true)
     } catch (e) {
       showError(e)
     }
   }
 }
 
-function submitClaim(row: VisualRow, lines: string[]) {
+function attentionAction(row: VisualRow): string {
+  return row.contextAction || row.action
+}
+
+function submitClaim(row: VisualRow, lines: string[]): Promise<void> {
   const span = row.spanBaseIDs
   if (span && span.length >= 2) {
     return enqueueSpanEdit(span[0], span[span.length - 1], lines)
   }
   // 上下文行只改正式锚点，绝不进 SubmitInsert
   if (row.isContext) {
-    return lines.length > 1 ? SubmitPaste(row.lineId, lines) : SubmitEdit(row.lineId, lines[0] ?? '')
+    return trackSubmit(lines.length > 1 ? SubmitPaste(row.lineId, lines) : SubmitEdit(row.lineId, lines[0] ?? ''))
   }
   if (row.action === ACTION_INSERT) {
-    return SubmitInsert(row.lineId, lines)
+    return trackSubmit(SubmitInsert(row.lineId, lines))
   }
-  return lines.length > 1 ? SubmitPaste(row.lineId, lines) : SubmitEdit(row.lineId, lines[0] ?? '')
+  if (row.action === ACTION_INSERT_BEFORE) return trackSubmit(SubmitInsertBefore(row.lineId, lines))
+  if (row.disputeId || row.partCount > 1) return trackSubmit(SubmitEditClaim(row.lineId, lines))
+  return trackSubmit(lines.length > 1 ? SubmitPaste(row.lineId, lines) : SubmitEdit(row.lineId, lines[0] ?? ''))
 }
 
 /** 收集主张 parts；优先读当前 doc，避免先前击键后 rowsRef 滞后 */
@@ -347,10 +367,12 @@ function saveCaret(v: EditorView) {
   if (!a) return
   lastCaretKey = a.key
   lastCaretOff = a.offset
-  lastCaretEnd = b && b.key === a.key ? b.offset : a.offset
+  lastAnchorKey = b?.key || a.key
+  lastCaretEnd = b?.offset ?? a.offset
 }
 
 function emitCaretFromView(v: EditorView) {
+  if (suppressSubmit || composing || !v.hasFocus) return
   const sel = v.state.selection.main
   const info = keyOffsetFromPos(v.state.doc, rowsRef, sel.head)
   if (!info) return
@@ -358,25 +380,35 @@ function emitCaretFromView(v: EditorView) {
   if (!row) return
   const endInfo = keyOffsetFromPos(v.state.doc, rowsRef, sel.anchor)
   const offset = info.offset
-  const selEnd = endInfo && endInfo.key === info.key ? endInfo.offset : offset
+  const endRow = rowsRef.find((r) => r.key === endInfo?.key) || row
+  const selEnd = endInfo?.offset ?? offset
+  const previous = rowsRef.find((r) => r.key === focusKey)
+  if (previous && (previous.lineId !== row.lineId || attentionAction(previous) !== attentionAction(row))) {
+    void blurSuspend(previous)
+  }
   lastCaretKey = info.key
   lastCaretOff = offset
   lastCaretEnd = selEnd
+  lastAnchorKey = endInfo?.key || info.key
   focusKey = info.key
   // 上下文：本人=正式行；他人假 disputeId 不上传，避免远端画错行
   const disputeId = row.isContext ? '' : row.disputeId || ''
   if (row.isContext && !row.isSelf) return
-  MoveCaret(row.lineId, disputeId, offset, selEnd).catch(() => {})
+  MoveCaretRange(row.lineId, disputeId, row.partIndex, offset,
+    endRow.lineId, endRow.isContext ? '' : endRow.disputeId || '', endRow.partIndex, selEnd).catch(() => {})
+  void resumeSuspend(row)
 }
 
 function applyRows(next: VisualRow[], force = false) {
   if (!view) return
-  if (composing && !force) {
-    pendingRows = next
+  if (!force && (composing || pendingSubmissions.size > 0)) {
+    deferredRows = next
     return
   }
-  pendingRows = null
+  deferredRows = null
   saveCaret(view)
+  const headRow = rowsRef.find((r) => r.key === lastCaretKey)
+  const anchorRow = rowsRef.find((r) => r.key === (lastAnchorKey || lastCaretKey))
   const doc = rowsToDoc(next)
   const same = doc === view.state.doc.toString()
   serverRows = next
@@ -385,21 +417,24 @@ function applyRows(next: VisualRow[], force = false) {
     view.dispatch({
       effects: [setRowsEffect.of(next), setCursorsEffect.of(cursorsRef)],
     })
+    placeStructuralCaret()
     return
   }
   suppressSubmit = true
   view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: doc },
-    annotations: syncAnn.of(true),
+    changes: textChange(view.state.doc.toString(), doc),
+    annotations: [syncAnn.of(true), Transaction.addToHistory.of(false)],
     effects: [setRowsEffect.of(next), setCursorsEffect.of(cursorsRef)],
   })
-  const from = posFromKeyOffset(view.state.doc, next, lastCaretKey, lastCaretOff)
-  const to = posFromKeyOffset(view.state.doc, next, lastCaretKey, lastCaretEnd)
+  const from = posFromKeyOffset(view.state.doc, next, lastCaretKey, lastCaretOff, headRow)
+  const to = posFromKeyOffset(view.state.doc, next, lastAnchorKey || lastCaretKey, lastCaretEnd, anchorRow)
   view.dispatch({
-    selection: EditorSelection.range(Math.min(from, to), Math.max(from, to)),
+    selection: EditorSelection.range(to, from),
     annotations: syncAnn.of(true),
   })
   suppressSubmit = false
+  placeStructuralCaret()
+  if (structuralCaret?.ready) structuralCaret = null
 }
 
 class DotMarker extends GutterMarker {
@@ -425,6 +460,10 @@ class DotMarker extends GutterMarker {
     wrap.appendChild(n)
     const dots = document.createElement('span')
     dots.className = 'cm-dots'
+    if (this.dots.length) {
+      dots.setAttribute('role', 'img')
+      dots.setAttribute('aria-label', `${this.dots.length} 位主张或追随者`)
+    }
     for (const c of this.dots) {
       const i = document.createElement('i')
       i.style.background = c
@@ -457,7 +496,7 @@ function lineClass(row: VisualRow): string {
   if (row.isSelf) parts.push('cm-self')
   else parts.push('cm-other')
   if (row.suspended) parts.push('cm-faded')
-  if (row.action === ACTION_INSERT) parts.push('cm-insert')
+  if (isInsertAction(row.action)) parts.push('cm-insert')
   if (row.action === ACTION_DELETE) parts.push('cm-delete')
   return parts.join(' ')
 }
@@ -517,28 +556,29 @@ const remoteCursorField = StateField.define<DecorationSet>({
     const marks: { from: number; to: number; value: Decoration }[] = []
     for (const c of cursors) {
       if (c.personId === meRef) continue
-      const idx = rows.findIndex(
-        (r) =>
-          r.lineId === c.lineId &&
-          (r.disputeId || '') === (c.disputeId || '') &&
-          !r.isContext &&
-          r.partIndex === 0,
-      )
+      const idx = cursorRowIndex(rows, c.lineId, c.disputeId, c.partIndex, c.personId)
       if (idx < 0 || idx >= tr.state.doc.lines) continue
       const line = tr.state.doc.line(idx + 1)
       const a = line.from + Math.max(0, Math.min(c.offset, line.length))
-      const b = line.from + Math.max(0, Math.min(c.selEnd ?? c.offset, line.length))
+      const endIdx = cursorRowIndex(rows, c.selEndLineId || c.lineId,
+        c.selEndLineId ? c.selEndDisputeId || '' : c.disputeId,
+        c.selEndLineId ? c.selEndPartIndex ?? 0 : c.partIndex, c.personId)
+      const endLine = endIdx >= 0 && endIdx < tr.state.doc.lines ? tr.state.doc.line(endIdx + 1) : line
+      const b = endLine.from + Math.max(0, Math.min(c.selEnd ?? c.offset, endLine.length))
       const from = Math.min(a, b)
       const to = Math.max(a, b)
       const col = colorFor(c.personId)
       if (from !== to) {
-        marks.push({
-          from,
-          to,
-          value: Decoration.mark({
-            attributes: { style: `background:${col}55` },
-          }),
-        })
+        for (let i = Math.min(idx, endIdx < 0 ? idx : endIdx); i <= Math.max(idx, endIdx); i++) {
+          const row = rows[i]
+          if (row.disputeId && row.disputeId !== c.disputeId && row.disputeId !== c.selEndDisputeId) continue
+          if (row.isContext && i !== idx && i !== endIdx) continue
+          const part = tr.state.doc.line(i + 1)
+          const start = Math.max(from, part.from)
+          const end = Math.min(to, part.to)
+          if (start < end) marks.push({ from: start, to: end,
+            value: Decoration.mark({ attributes: { style: `background:${col}55` } }) })
+        }
       }
       marks.push({
         from: a,
@@ -576,15 +616,15 @@ function changeAllowed(
   return 'cross'
 }
 
-function afterUserEdit(v: EditorView) {
-  if (suppressSubmit || composing) return
+function afterUserEdit(v: EditorView): Promise<void> {
+  if (suppressSubmit || composing) return Promise.resolve()
   const rows = rowsRef
-  if (!rows.length) return
+  if (!rows.length) return Promise.resolve()
   const head = v.state.selection.main.head
   const line = v.state.doc.lineAt(head)
   const idx = line.number - 1
   const row = rows[idx]
-  if (!row || !row.editable) return
+  if (!row || !row.editable) return Promise.resolve()
   const idxs = unitLineIndices(rows, idx).filter((i) => !rows[i]?.isContext)
   let payload: string[]
   if (row.isContext) {
@@ -596,108 +636,191 @@ function afterUserEdit(v: EditorView) {
   } else {
     payload = [line.text]
   }
-  submitClaim(row, payload).catch((e) => {
+  const submission = submitClaim(row, payload).catch((e) => {
     showError(e)
     revertDoc()
   })
   emitCaretFromView(v)
   armSuspend(row)
+  return submission
+}
+
+function placeStructuralCaret() {
+  if (!view || !structuralCaret?.ready || rowsRef.length < structuralCaret.minRows) return
+  const { row, part, offset, insert } = structuralCaret
+  let index: number
+  if (insert) {
+    const candidate = rowsRef.findIndex((r) => r.lineId === row.lineId &&
+      r.action === ACTION_INSERT && r.isSelf && !r.isContext)
+    const anchor = rowsRef.findIndex((r) => r.lineId === row.lineId && r.isSelf)
+    index = candidate >= 0 ? candidate + part : anchor >= 0 ? anchor + 1 + part : -1
+  } else {
+    const head = rowsRef.findIndex((r) => r.lineId === row.lineId && r.isSelf &&
+      (row.isContext ? r.isContext && r.contextAction === row.contextAction : !r.isContext) && r.partIndex === 0 &&
+      r.action === row.action)
+    index = head >= 0 ? head + part : -1
+  }
+  if (index < 0 || index >= rowsRef.length || index >= view.state.doc.lines) return
+  if (rowsRef[index].content !== structuralCaret.text) return
+  const pos = caretPosInRows(rowsRef, index, offset)
+  suppressSubmit = true
+  view.dispatch({ selection: EditorSelection.cursor(pos), scrollIntoView: true, annotations: syncAnn.of(true) })
+  suppressSubmit = false
+  saveCaret(view)
+  structuralCaret = null
+}
+
+/** 保留原生事务和撤销信息，提交方式由同一过滤入口决定。 */
+function replaceSelection(v: EditorView, inserted: string): boolean {
+  const { from, to } = v.state.selection.main
+  v.dispatch({
+    changes: { from, to, insert: inserted },
+    selection: EditorSelection.cursor(from + inserted.length),
+    userEvent: 'input',
+    scrollIntoView: true,
+  })
+  return true
+}
+
+/** 行首锚定下方原行，行尾锚定上方原行；已有候选继续保留全文。 */
+function applyInsertChange(rowIndex: number, before: boolean): TransactionSpec {
+  const row = rowsRef[rowIndex]
+  const action = before ? ACTION_INSERT_BEFORE : ACTION_INSERT
+  const existing = rowsRef.map((r, i) => ({ r, i })).filter(({ r }) => r.lineId === row.lineId && r.action === action && r.isSelf && !r.isContext)
+  const texts = existing.map(({ r, i }) => view?.state.doc.line(i + 1).text ?? r.content)
+  const content = before ? [...texts, ''] : ['', ...texts]
+  const inserted: VisualRow = { ...row, key: 'insert:' + action + ':' + row.lineId + ':' + texts.length,
+    content: '', action, contextAction: undefined,
+    disputeId: existing[0]?.r.disputeId || '', followId: '', isContext: false,
+    partIndex: before ? texts.length : 0, partCount: content.length,
+    showLineNo: false, blockStart: false, separatorBefore: false }
+  const previous = rowsRef.map((r) => r.lineId === row.lineId && r.action === action && r.isSelf && !r.isContext ?
+    { ...r, partIndex: r.partIndex + (before ? 0 : 1), partCount: content.length } : r)
+  const at = rowIndex + (before ? 0 : 1)
+  const next = [...previous.slice(0, at), inserted, ...previous.slice(at)]
+  rowsRef = next
+  const target = { row, part: 0, offset: 0, insert: !before, ready: false, minRows: next.length, text: before ? row.content : '' }
+  structuralCaret = target
+  void trackSubmit(before ? SubmitInsertBefore(row.lineId, content) : SubmitInsert(row.lineId, content)).then(async () => {
+    target.ready = true
+    await nextTick()
+    placeStructuralCaret()
+  }).catch((e) => { structuralCaret = null; showError(e); revertDoc() })
+  return { effects: setRowsEffect.of(next), annotations: syncAnn.of(true) }
 }
 
 function handleEnter(v: EditorView): boolean {
-  if (composing) return true
-  const sel = v.state.selection.main
-  if (!sel.empty) {
-    const verdict = changeAllowed(rowsRef, v.state.doc, sel.from, sel.to)
-    if (verdict === 'cross') {
-      showError(CROSS_MSG)
-      return true
-    }
-    if (verdict === 'protected') return true
-    if (verdict === 'span') {
-      const idxs = touchedLineIndexes(v.state.doc, sel.from, sel.to)
-      commitSpanFromView(v, idxs, sel.from, sel.to, '\n')
-      return true
-    }
+  if (composing || v.composing) return false
+  return replaceSelection(v, '\n')
+}
+
+/** 候选内删换行、撤销和重做也作为一整份主张提交，不能把下方正文误收进来。 */
+function applyUnitChange(doc: Text, from: number, to: number, inserted: string): TransactionSpec {
+  const start = doc.lineAt(from)
+  const end = doc.lineAt(to)
+  const rowIndex = start.number - 1
+  const row = rowsRef[rowIndex]
+  const indices = row.isContext ? [rowIndex] : unitLineIndices(rowsRef, rowIndex).filter((i) => !rowsRef[i].isContext)
+  const parts = indices.map((i) => doc.line(i + 1).text)
+  const replacement = buildSpanReplacement(doc, from, to, inserted)
+  parts.splice(row.partIndex, end.number - start.number + 1, ...replacement)
+  const caret = caretAfterSpanInsert(start.text.slice(0, from - start.from), inserted)
+  const first = indices[0]
+  const head = rowsRef[first]
+  const next = [...rowsRef.slice(0, first), ...parts.map((content, partIndex) => ({
+    ...head, content, partIndex, partCount: parts.length,
+    key: partIndex === 0 ? head.key : head.key + ':part:' + partIndex,
+    showLineNo: partIndex === 0 && head.showLineNo,
+    blockStart: partIndex === 0 && head.blockStart,
+    separatorBefore: partIndex === 0 && head.separatorBefore,
+  })), ...rowsRef.slice(indices[indices.length - 1] + 1)]
+  rowsRef = next
+  if (!composing) {
+    const target = { row: head, part: row.partIndex + caret.part, offset: caret.offset,
+      insert: false, ready: false, minRows: next.length, text: parts[row.partIndex + caret.part] }
+    structuralCaret = target
+    void submitClaim(row, parts).then(async () => {
+      target.ready = true
+      await nextTick()
+      placeStructuralCaret()
+    }).catch((e) => { structuralCaret = null; showError(e); revertDoc() })
   }
-  const line = v.state.doc.lineAt(sel.head)
-  const idx = line.number - 1
-  const row = rowsRef[idx]
-  if (!row || !row.editable) return true
-  const offset = sel.head - line.from
-  const val = line.text
-  void (async () => {
-    try {
-      if (offset >= val.length && row.partIndex === row.partCount - 1) {
-        if (!row.isContext && row.action === ACTION_INSERT) {
-          const lines = payloadLines(rowsRef, idx, val)
-          lines.push('')
-          await SubmitInsert(row.lineId, lines)
-        } else {
-          // 上下文/正式行末尾 Enter：新开插入主张
-          await SubmitInsert(row.lineId, [''])
-        }
-        return
-      }
-      const left = val.slice(0, offset)
-      const right = val.slice(offset)
-      if (row.isContext) {
-        await submitClaim(row, [left, right])
-        return
-      }
-      const lines = payloadLines(rowsRef, idx, left)
-      lines.splice(row.partIndex + 1, 0, right)
-      lines[row.partIndex] = left
-      if (row.spanBaseIDs && row.spanBaseIDs.length >= 2) {
-        commitSpanClaim(v, spanClaimIdxs(idx), lines, row.partIndex + 1, 0)
-        return
-      }
-      await submitClaim(row, lines)
-    } catch (e) {
-      showError(e)
-      revertDoc()
-    }
-  })()
-  return true
+  return {
+    changes: textChange(doc.toString(), rowsToDoc(next)),
+    selection: EditorSelection.cursor(caretPosInRows(next, first + row.partIndex + caret.part, caret.offset)),
+    effects: setRowsEffect.of(next), annotations: syncAnn.of(true),
+  }
 }
 
 function handleBackspace(v: EditorView): boolean {
-  if (composing) return false
+  if (composing || v.composing) return false
   const sel = v.state.selection.main
   if (!sel.empty) return false
   const line = v.state.doc.lineAt(sel.head)
-  if (sel.head - line.from !== 0) return false
+  if (sel.head !== line.from) return false
   const idx = line.number - 1
   const row = rowsRef[idx]
-  if (!row || !row.editable) return true
-  void (async () => {
-    try {
-      if (row.isContext) {
-        if (line.text.length === 0) await DeleteLine(row.lineId)
-        else await MergeUp(row.lineId)
-        return
-      }
-      if (row.partIndex > 0) {
-        const lines = payloadLines(rowsRef, idx, line.text)
-        const joinAt = (lines[row.partIndex - 1] || '').length
-        lines[row.partIndex - 1] = (lines[row.partIndex - 1] || '') + (lines[row.partIndex] || '')
-        lines.splice(row.partIndex, 1)
-        if (row.spanBaseIDs && row.spanBaseIDs.length >= 2) {
-          commitSpanClaim(v, spanClaimIdxs(idx), lines, row.partIndex - 1, joinAt)
-          return
-        }
-        await submitClaim(row, lines)
-        return
-      }
-      if (row.action === ACTION_INSERT || row.action === ACTION_DELETE) return
-      if (line.text.length === 0) await DeleteLine(row.lineId)
-      else await MergeUp(row.lineId)
-    } catch (e) {
-      showError(e)
-      revertDoc()
+  if (!row?.editable) return true
+  if (row.partIndex > 0 && !row.isContext) {
+    const lines = payloadLines(rowsRef, idx, line.text)
+    const joinAt = lines[row.partIndex - 1].length
+    lines[row.partIndex - 1] += lines[row.partIndex]
+    lines.splice(row.partIndex, 1)
+    if (row.spanBaseIDs?.length) {
+      commitSpanClaim(v, spanClaimIdxs(idx), lines, row.partIndex - 1, joinAt)
+      return true
     }
-  })()
+    const target = { row, part: row.partIndex - 1, offset: joinAt, insert: false, ready: false,
+      minRows: rowsRef.length - 1, text: lines[row.partIndex - 1] }
+    structuralCaret = target
+    void submitClaim(row, lines).then(async () => {
+      target.ready = true
+      await nextTick()
+      placeStructuralCaret()
+    }).catch((e) => { structuralCaret = null; showError(e); revertDoc() })
+    return true
+  }
+  if (isInsertAction(row.action) || row.action === ACTION_DELETE) return true
+  const previous = rowsRef[idx - 1]
+  if (previous && previous.isSelf) {
+    structuralCaret = { row: previous, part: previous.partIndex, offset: previous.content.length, insert: false,
+      ready: false, minRows: rowsRef.length - 1, text: previous.content + line.text }
+  }
+  void trackSubmit(line.text.length === 0 ? DeleteLine(row.lineId) : MergeUp(row.lineId))
+    .then(async () => { if (structuralCaret) structuralCaret.ready = true; await nextTick(); placeStructuralCaret() })
+    .catch((e) => { structuralCaret = null; showError(e); revertDoc() })
   return true
+}
+
+async function prepareLeave() {
+  if (composing) throw new Error('请先完成当前输入，再切换文档')
+  await Promise.all([...pendingSubmissions])
+  if (view) {
+    const row = rowsRef.find((r) => r.key === focusKey)
+    if (row) await blurSuspend(row)
+  }
+}
+
+async function confirmFollow() {
+  if (!followTarget.value || following.value) return
+  following.value = true
+  try {
+    await prepareLeave()
+    await trackSubmit(RequestFollow(followTarget.value))
+    followTarget.value = ''
+  } catch (e) { showError(e) }
+  finally { following.value = false }
+}
+
+defineExpose({ prepareLeave, focus: () => view?.focus() })
+
+function runHistory(v: EditorView, command: StateCommand): boolean {
+  return command({ state: v.state, dispatch: (tr) => {
+    const change = changedRange(tr.changes, tr.newDoc)
+    const verdict = changeAllowed(tr.startState.field(rowsField), tr.startState.doc, change.from, change.to)
+    if (verdict === 'protected' || verdict === 'cross') { showError(CROSS_MSG); return }
+    v.dispatch(tr)
+  } })
 }
 
 function buildExtensions(): Extension {
@@ -707,56 +830,67 @@ function buildExtensions(): Extension {
     lineDecoField,
     remoteCursorField,
     rowGutter,
+    EditorView.contentAttributes.of({ 'aria-label': '文档内容', 'aria-multiline': 'true' }),
+    EditorView.domEventHandlers({ beforeinput: (event, editor) => {
+      if (event.inputType !== 'historyUndo' && event.inputType !== 'historyRedo') return false
+      event.preventDefault()
+      runHistory(editor, event.inputType === 'historyUndo' ? undo : redo)
+      return true
+    } }),
     history(),
     EditorView.lineWrapping,
     keymap.of([
       { key: 'Enter', run: handleEnter },
       { key: 'Backspace', run: handleBackspace },
     ]),
-    keymap.of(historyKeymap),
+    keymap.of([
+      { key: 'Mod-z', run: (v) => runHistory(v, undo), shift: (v) => runHistory(v, redo), preventDefault: true },
+      { key: 'Mod-y', run: (v) => runHistory(v, redo), preventDefault: true },
+    ]),
     keymap.of(defaultKeymap.filter((b) => b.key !== 'Enter')),
-    // 跨度：改写为本笔乐观折叠；保护/跨争议直接丢弃
+    EditorView.domEventObservers({ compositionstart: () => { composing = true } }),
+    // CodeMirror 原生历史使用 filter:false；extender 仍会执行，且不丢历史注解。
+    EditorState.transactionExtender.of((tr) => {
+      if (!tr.docChanged || (!tr.isUserEvent('undo') && !tr.isUserEvent('redo'))) return null
+      const { from, to, insert } = changedRange(tr.changes, tr.newDoc)
+      const verdict = changeAllowed(tr.startState.field(rowsField), tr.startState.doc, from, to)
+      if (verdict === 'protected' || verdict === 'cross') return null
+      const spec = verdict === 'span' ? applySpanLocally(tr.startState.doc,
+        touchedLineIndexes(tr.startState.doc, from, to), from, to, insert) :
+        applyUnitChange(tr.startState.doc, from, to, insert)
+      return { effects: spec.effects, annotations: syncAnn.of(true) }
+    }),
+    // 原生撤销可能含多个相邻变更，按实际改动的首尾统一计算一次主张。
     EditorState.transactionFilter.of((tr) => {
       if (!tr.docChanged || tr.annotation(syncAnn)) return tr
-      const rows = rowsRef
-      const ranges: { fromA: number; toA: number }[] = []
-      let protectedHit = false
-      let crossHit = false
-      let spanHit = false
-      tr.changes.iterChangedRanges((fromA, toA) => {
-        ranges.push({ fromA, toA })
-        const v = changeAllowed(rows, tr.startState.doc, fromA, toA)
-        if (v === 'protected') protectedHit = true
-        if (v === 'cross') crossHit = true
-        if (v === 'span') spanHit = true
-      })
-      if (protectedHit) return []
-      if (crossHit || (spanHit && ranges.length !== 1)) {
+      const { from, to, insert } = changedRange(tr.changes, tr.newDoc)
+      const verdict = changeAllowed(rowsRef, tr.startState.doc, from, to)
+      if (verdict === 'protected' || verdict === 'cross') {
         queueMicrotask(() => showError(CROSS_MSG))
         return []
       }
-      if (!spanHit) return tr
-      const { fromA, toA } = ranges[0]
-      let inserted = ''
-      tr.changes.iterChanges((f, t, _fb, _tb, ins) => {
-        if (f === fromA && t === toA) inserted = ins.toString()
-      })
-      const idxs = touchedLineIndexes(tr.startState.doc, fromA, toA)
-      return [
-        applySpanLocally(
-          tr.startState.doc,
-          tr.startState.doc.length,
-          idxs,
-          fromA,
-          toA,
-          inserted,
-        ),
-      ]
+      let spec: TransactionSpec
+      if (verdict === 'span') {
+        spec = applySpanLocally(tr.startState.doc,
+          touchedLineIndexes(tr.startState.doc, from, to), from, to, insert)
+      } else if (tr.startState.doc.sliceString(from, to).includes('\n') || insert.includes('\n')) {
+        const line = tr.startState.doc.lineAt(from)
+        const row = rowsRef[line.number - 1]
+        const insertAtEdge = insert === '\n' && from === to && (from === line.to || from === line.from) &&
+          row.action === ACTION_EDIT && row.partCount === 1 && !row.spanBaseIDs?.length &&
+          !tr.isUserEvent('undo') && !tr.isUserEvent('redo')
+        spec = insertAtEdge ? applyInsertChange(line.number - 1, from === line.from) :
+          applyUnitChange(tr.startState.doc, from, to, insert)
+      } else {
+        return tr
+      }
+      // 保留原事务中的历史注解；只补充投影，避免撤销变成一次全新的输入。
+      return [tr, { effects: spec.effects, annotations: syncAnn.of(true) }]
     }),
     EditorView.updateListener.of((vu: ViewUpdate) => {
       if (vu.selectionSet) emitCaretFromView(vu.view)
       if (vu.docChanged && !vu.transactions.some((t) => t.annotation(syncAnn))) {
-        afterUserEdit(vu.view)
+        void afterUserEdit(vu.view)
       }
     }),
     EditorView.domEventHandlers({
@@ -765,13 +899,12 @@ function buildExtensions(): Extension {
         return false
       },
       compositionend: (_e, v) => {
-        composing = false
-        if (pendingRows) {
-          const p = pendingRows
-          pendingRows = null
-          applyRows(p, true)
-        }
-        afterUserEdit(v)
+        // 先提交上屏文字，再采用最新快照；旧快照不能覆盖输入法刚提交的内容。
+        queueMicrotask(async () => {
+          composing = false
+          await afterUserEdit(v)
+          flushDeferredRows()
+        })
         return false
       },
       focus: (_e, v) => {
@@ -794,57 +927,11 @@ function buildExtensions(): Extension {
       paste: (e, v) => {
         const text = e.clipboardData?.getData('text/plain')
         if (!text) return false
-        const sel = v.state.selection.main
-        const verdict = changeAllowed(rowsRef, v.state.doc, sel.from, sel.to)
-        if (verdict === 'span') {
-          e.preventDefault()
-          const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-          const idxs = touchedLineIndexes(v.state.doc, sel.from, sel.to)
-          commitSpanFromView(v, idxs, sel.from, sel.to, normalized)
-          return true
-        }
-        if (!text.includes('\n')) return false
+        const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+        if (!normalized.includes('\n') && v.state.doc.lineAt(v.state.selection.main.from).number ===
+          v.state.doc.lineAt(v.state.selection.main.to).number) return false
         e.preventDefault()
-        const line = v.state.doc.lineAt(sel.head)
-        const idx = line.number - 1
-        const row = rowsRef[idx]
-        if (!row || !row.editable) return true
-        if (verdict === 'cross') {
-          showError(CROSS_MSG)
-          return true
-        }
-        if (verdict === 'protected') return true
-        if (v.state.doc.lineAt(sel.from).number !== v.state.doc.lineAt(sel.to).number) {
-          showError(CROSS_MSG)
-          return true
-        }
-        const start = Math.min(sel.from, sel.to) - line.from
-        const end = Math.max(sel.from, sel.to) - line.from
-        const before = line.text.slice(0, start)
-        const after = line.text.slice(end)
-        const chunks = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
-        chunks[0] = before + chunks[0]
-        chunks[chunks.length - 1] = chunks[chunks.length - 1] + after
-        if (row.isContext) {
-          submitClaim(row, chunks).catch((err) => {
-            showError(err)
-            revertDoc()
-          })
-          return true
-        }
-        const lines = payloadLines(rowsRef, idx, chunks[0])
-        lines.splice(row.partIndex, 1, ...chunks)
-        if (row.spanBaseIDs && row.spanBaseIDs.length >= 2) {
-          const caretPart = row.partIndex + chunks.length - 1
-          const caretOff = chunks[chunks.length - 1].length - after.length
-          commitSpanClaim(v, spanClaimIdxs(idx), lines, caretPart, caretOff)
-          return true
-        }
-        submitClaim(row, lines).catch((err) => {
-          showError(err)
-          revertDoc()
-        })
-        return true
+        return replaceSelection(v, normalized)
       },
       click: (e, v) => {
         const pos = v.posAtCoords({ x: e.clientX, y: e.clientY })
@@ -853,8 +940,7 @@ function buildExtensions(): Extension {
         const row = rowsRef[line.number - 1]
         const follow = row?.followId || ''
         if (!row || row.isSelf || row.phantom || !follow) return false
-        if (!window.confirm('接受他的，放弃我的？')) return true
-        RequestFollow(follow).catch(showError)
+        followTarget.value = follow
         return true
       },
     }),
@@ -934,6 +1020,9 @@ onMounted(() => {
   view.dispatch({
     effects: [setRowsEffect.of(props.rows), setCursorsEffect.of(props.cursors)],
   })
+  const initial = props.rows.findIndex((r) => r.lineId === props.initialLineId && r.isSelf)
+  if (initial >= 0) view.dispatch({ selection: EditorSelection.cursor(caretPosInRows(props.rows, initial, 0)) })
+  view.focus()
 })
 
 onBeforeUnmount(() => {
@@ -966,6 +1055,10 @@ watch(
 
 <template>
   <div ref="host" class="single-editor" />
+  <ModalDialog :model-value="!!followTarget" title="接受这份主张" :busy="following" @update:model-value="followTarget = ''">
+    <p>接受他的主张，放弃我的？</p>
+    <div class="actions"><button :disabled="following" @click="confirmFollow">接受</button><button class="quiet" :disabled="following" autofocus @click="followTarget = ''">取消</button></div>
+  </ModalDialog>
 </template>
 
 <style scoped>

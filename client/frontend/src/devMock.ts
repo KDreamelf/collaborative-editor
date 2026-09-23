@@ -11,12 +11,25 @@ function installMockBindings() {
       App: {
         PersonID: async () => 'me',
         MoveCaret: async () => {},
+        MoveCaretRange: async (...args: unknown[]) => { log.push(['MoveCaretRange', ...args]) },
+        GetServer: async () => 'http://127.0.0.1:8787',
+        SetServer: async () => {},
+        GetSaveWarning: async () => '',
+        GetCachedArticle: async () => null,
+        ListArticles: async () => [],
+        ListUnsynced: async () => [],
         Suspend: async () => {},
         SubmitEdit: async (...args: unknown[]) => {
           log.push(['SubmitEdit', ...args])
         },
+        SubmitEditClaim: async (...args: unknown[]) => {
+          log.push(['SubmitEditClaim', ...args])
+        },
         SubmitInsert: async (...args: unknown[]) => {
           log.push(['SubmitInsert', ...args])
+        },
+        SubmitInsertBefore: async (...args: unknown[]) => {
+          log.push(['SubmitInsertBefore', ...args])
         },
         SubmitPaste: async (...args: unknown[]) => {
           log.push(['SubmitPaste', ...args])
@@ -113,6 +126,7 @@ function mockInsertSnapshot(noSelf: boolean): Snapshot {
         name: 'Alice',
         lineId: 'L2',
         disputeId: 'Di-a',
+        partIndex: 1,
         offset: 1,
         selEnd: 1,
       },
@@ -186,6 +200,10 @@ export function loadDevMock(): { me: string; snap: Snapshot; cursors: Cursor[] }
   const noSelfSpan = /(?:\?|&)selfSpan=0(?:&|$)/.test(location.search)
   const spanFix = /(?:\?|&)span=1(?:&|$)/.test(location.search)
   const snap = spanFix ? mockSpanSnapshot(noSelfSpan) : mockInsertSnapshot(noSelf)
+  if (!spanFix && new URLSearchParams(location.search).get('before') === '1') {
+    snap.article.title = 'mock·行首插入'
+    snap.disputes = snap.disputes.map((d) => d.action === '插在后面' ? { ...d, action: '插在前面' } : d)
+  }
   installMockBindings()
   return { me: 'me', snap, cursors: snap.cursors || [] }
 }

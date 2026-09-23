@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,7 @@ type App struct {
 	people  []protocol.Person
 
 	conn          *websocket.Conn
+	connGen       uint64 // 切文档/重连递增；旧 readLoop 消息丢弃
 	dialing       bool
 	joined        bool
 	reconnectWait time.Duration
@@ -55,15 +57,21 @@ type App struct {
 	lastEnqAt  time.Time
 	flushTimer *time.Timer
 
-	// afterSeen / lineBase：最后已应用的服务端快照里各正式行当时的后继与正文。乐观本地改动不写这里。
-	afterSeen map[string]string
-	lineBase  map[string]string
+	// afterSeen / beforeSeen / lineBase：最后已应用的服务端快照里各正式行当时的后继、前驱与正文。乐观本地改动不写这里。
+	afterSeen  map[string]string
+	beforeSeen map[string]string
+	lineBase   map[string]string
 
-	stateDir   string // 空则用 UserConfigDir；测试可注入临时目录
-	sessions   map[string]*persistSession
-	lastArt    string
-	serverSnap *protocol.Snapshot
-	rejected   []rejectedOp
+	stateDir       string // 空则用 UserConfigDir；测试可注入临时目录
+	sessions       map[string]*persistSession
+	lastArt        string
+	serverSnap     *protocol.Snapshot
+	rejected       []rejectedOp
+	saveWarning    string
+	saveRetryTimer *time.Timer
+
+	// httpTimeout：HTTP/WS 握手时限；0 表示 10s。测试可注入短值。
+	httpTimeout time.Duration
 }
 
 func NewApp() *App {
@@ -132,15 +140,112 @@ func (a *App) ReportError(id, message string) {
 	_, _ = fmt.Fprintf(f, "[%s] %s\n", id, message)
 }
 
-func (a *App) SetServer(raw string) {
+func (a *App) GetServer() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.serverURL
+}
+
+// SetServer 校验服务根地址；有任意待送/未同步时拒绝。切换成功清空旧服务缓存，保留个人身份。
+func (a *App) SetServer(raw string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	normalized, err := normalizeServerURL(raw)
+	if err != nil {
+		return err
+	}
+	if normalized == a.serverURL {
+		return nil
+	}
+	if a.hasPendingAnywhereLocked() {
+		return fmt.Errorf("还有未发送或未同步的修改，请处理后再切换服务器")
+	}
+	a.serverURL = normalized
+	a.connGen++
+	if a.conn != nil {
+		_ = a.conn.Close()
+		a.conn = nil
+	}
+	a.joined = false
+	a.dialing = false
+	a.sentCount = 0
+	a.sentSeq = 0
+	a.clearSaveWarningLocked()
+	a.clearServiceCacheLocked()
+	a.emitOfflineLocked(true)
+	a.persistAfterMutationLocked()
+	return nil
+}
+
+// normalizeServerURL 只接受 http(s) 服务根（无 userinfo/query/fragment/path）。
+func normalizeServerURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return
+		return "", fmt.Errorf("服务器地址不能为空")
 	}
-	a.serverURL = strings.TrimRight(raw, "/")
-	_ = a.savePersistLocked()
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("请输入有效的 http 或 https 地址")
+	}
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("请输入有效的 http 或 https 地址")
+	}
+	if path := strings.TrimRight(u.Path, "/"); path != "" {
+		return "", fmt.Errorf("请输入有效的 http 或 https 地址")
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("请输入有效的 http 或 https 地址")
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("请输入有效的 http 或 https 地址")
+		}
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+// clearServiceCacheLocked 丢掉旧服务干净缓存/当前文档/会话快照；保留 personID。
+func (a *App) clearServiceCacheLocked() {
+	a.sessions = map[string]*persistSession{}
+	a.queue = nil
+	a.rejected = nil
+	a.serverSnap = nil
+	a.doc = nil
+	a.articleID = ""
+	a.lastArt = ""
+	a.name = ""
+	a.afterSeen = nil
+	a.beforeSeen = nil
+	a.lineBase = nil
+	a.people = nil
+	a.cursors = nil
+	a.deferred = nil
+	a.nextSeq = 1
+	a.oldestAt = time.Time{}
+	a.lastEnqAt = time.Time{}
+}
+
+func (a *App) hasPendingAnywhereLocked() bool {
+	if len(a.queue) > 0 || len(a.rejected) > 0 {
+		return true
+	}
+	for _, sess := range a.sessions {
+		if sess == nil {
+			continue
+		}
+		if len(sess.Queue) > 0 || len(sess.Rejected) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// GetSaveWarning 本地写盘失败且正在重试时的提示；空串表示正常。
+func (a *App) GetSaveWarning() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.saveWarning
 }
 
 // GetCachedArticle 最近一份可继续的本地会话（含未发队列或未同步原文）。
@@ -253,6 +358,7 @@ func (a *App) Join(articleID, name string) error {
 			a.mu.Unlock()
 			return fmt.Errorf("本地保存失败，请检查磁盘后重试")
 		}
+		a.connGen++
 		a.queue = nil
 		a.rejected = nil
 		a.serverSnap = nil
@@ -261,12 +367,14 @@ func (a *App) Join(articleID, name string) error {
 		a.deferred = nil
 		a.doc = nil
 		a.afterSeen = nil
+		a.beforeSeen = nil
 		a.lineBase = nil
 		if a.conn != nil {
 			_ = a.conn.Close()
 			a.conn = nil
 		}
 		a.joined = false
+		a.emitOfflineLocked(true)
 	}
 	a.articleID = articleID
 	a.name = name
@@ -277,7 +385,7 @@ func (a *App) Join(articleID, name string) error {
 	if a.doc == nil {
 		a.doc = document.New("")
 	}
-	_ = a.savePersistLocked()
+	a.persistAfterMutationLocked()
 	a.emitSnapshotLocked()
 	a.emitUnsyncedLocked()
 	a.mu.Unlock()
@@ -320,14 +428,22 @@ func (a *App) emitOfflineLocked(offline bool) {
 }
 
 func (a *App) SubmitEdit(lineID, content string) error {
-	return a.enqueueSubmit(lineID, model.ActionEdit, []string{content})
+	return a.enqueueSubmit(lineID, model.ActionEdit, []string{content}, false)
 }
 
 func (a *App) SubmitPaste(lineID string, lines []string) error {
 	if len(lines) == 0 {
 		return fmt.Errorf("粘贴内容为空")
 	}
-	return a.enqueueSubmit(lineID, model.ActionEdit, lines)
+	return a.enqueueSubmit(lineID, model.ActionEdit, lines, false)
+}
+
+// SubmitEditClaim 明确更新本人整份候选（含临时多行缩成一行）。WholeClaim=true。
+func (a *App) SubmitEditClaim(lineID string, lines []string) error {
+	if len(lines) == 0 {
+		return fmt.Errorf("内容为空")
+	}
+	return a.enqueueSubmit(lineID, model.ActionEdit, lines, true)
 }
 
 // SubmitSpanEdit 跨多条正式行整段替换。基准只取 serverSnap，一个范围一个 Op。
@@ -406,7 +522,18 @@ func (a *App) SubmitInsert(lineID string, lines []string) error {
 	if len(lines) == 0 {
 		lines = []string{""}
 	}
-	return a.enqueueSubmit(lineID, model.ActionInsert, lines)
+	return a.enqueueSubmit(lineID, model.ActionInsert, lines, false)
+}
+
+// SubmitInsertBefore 行首 Enter：在当前正式行前插入。争议 RealLine 仍指该原行。
+func (a *App) SubmitInsertBefore(lineID string, lines []string) error {
+	if lines == nil {
+		lines = []string{""}
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	return a.enqueueSubmit(lineID, model.ActionInsertBefore, lines, false)
 }
 
 func (a *App) DeleteLine(lineID string) error {
@@ -468,17 +595,26 @@ func (a *App) MergeUp(lineID string) error {
 }
 
 func (a *App) MoveCaret(lineID, disputeID string, offset, selEnd int) error {
+	return a.MoveCaretRange(lineID, disputeID, 0, offset, "", "", 0, selEnd)
+}
+
+// MoveCaretRange 跨行/分段选区光标；零值字段兼容旧 Cursor。
+func (a *App) MoveCaretRange(lineID, disputeID string, partIndex, offset int, selEndLineID, selEndDisputeID string, selEndPartIndex, selEnd int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	msg := protocol.CursorMsg{
 		Type: protocol.TypeCursor,
 		Cursor: protocol.Cursor{
-			PersonID:  a.personID,
-			Name:      a.name,
-			LineID:    lineID,
-			DisputeID: disputeID,
-			Offset:    offset,
-			SelEnd:    selEnd,
+			PersonID:        a.personID,
+			Name:            a.name,
+			LineID:          lineID,
+			DisputeID:       disputeID,
+			Offset:          offset,
+			SelEnd:          selEnd,
+			PartIndex:       partIndex,
+			SelEndLineID:    selEndLineID,
+			SelEndDisputeID: selEndDisputeID,
+			SelEndPartIndex: selEndPartIndex,
 		},
 	}
 	return a.sendAfterEditsLocked(msg)
@@ -574,7 +710,7 @@ func (a *App) AnswerFollow(fromID, disputeID string, accept bool) error {
 	return nil
 }
 
-func (a *App) enqueueSubmit(lineID, action string, content []string) error {
+func (a *App) enqueueSubmit(lineID, action string, content []string, wholeClaim bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.doc == nil {
@@ -585,11 +721,11 @@ func (a *App) enqueueSubmit(lineID, action string, content []string) error {
 		return err
 	}
 	content = append([]string(nil), content...)
-	opts, afterSeen, baseContent, lineIDs := a.buildSubmitExtrasLocked(lineID, action, content)
-	if err := a.doc.SubmitWith(a.personID, id, action, content, opts); err != nil {
-		return err
-	}
+	opts, afterSeen, beforeSeen, baseContent, lineIDs := a.buildSubmitExtrasLocked(lineID, action, content)
+	opts.WholeClaim = wholeClaim
+	// 先构造 Op：领域拒绝时仍能保留可复制原文（与 span 一致）。
 	op := protocol.Op{
+		ID:   model.NewID().Hex(),
 		Kind: protocol.TypeSubmit,
 		Submit: &protocol.Submit{
 			Type:        protocol.TypeSubmit,
@@ -599,9 +735,14 @@ func (a *App) enqueueSubmit(lineID, action string, content []string) error {
 			Content:     content,
 			ClientTs:    time.Now().UnixMilli(),
 			AfterSeen:   afterSeen,
+			BeforeSeen:  beforeSeen,
 			BaseContent: baseContent,
 			LineIDs:     lineIDs,
+			WholeClaim:  wholeClaim,
 		},
+	}
+	if err := a.doc.SubmitWith(a.personID, id, action, content, opts); err != nil {
+		return a.saveLocalSpanRejectLocked(op)
 	}
 	if err := a.pushOpLocked(op); err != nil {
 		return err
@@ -643,10 +784,11 @@ func (a *App) spanBasesFromServerSnapLocked(startHex, endHex string) ([]model.ID
 	return baseIDs, baseTexts, lines[endIdx].Next, nil
 }
 
-// buildSubmitExtrasLocked：基准后继/正文只取服务端快照；新行 ID 客户端预生。
-func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (document.SubmitOpts, *string, *string, []string) {
+// buildSubmitExtrasLocked：基准后继/前驱/正文只取服务端快照；新行 ID 客户端预生。
+func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (document.SubmitOpts, *string, *string, *string, []string) {
 	var opts document.SubmitOpts
 	var afterPtr *string
+	var beforePtr *string
 	var basePtr *string
 	var idStrs []string
 	if action == model.ActionInsert && a.afterSeen != nil {
@@ -659,6 +801,16 @@ func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (
 			}
 		}
 	}
+	if action == model.ActionInsertBefore && a.beforeSeen != nil {
+		if prev, ok := a.beforeSeen[lineID]; ok {
+			cp := prev
+			beforePtr = &cp
+			seen, err := model.ParseID(prev)
+			if err == nil {
+				opts.BeforeSeen = &seen
+			}
+		}
+	}
 	if action == model.ActionEdit && a.lineBase != nil {
 		if text, ok := a.lineBase[lineID]; ok {
 			cp := text
@@ -667,7 +819,7 @@ func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (
 		}
 	}
 	n := 0
-	if action == model.ActionInsert {
+	if action == model.ActionInsert || action == model.ActionInsertBefore {
 		n = len(content)
 	} else if action == model.ActionEdit && len(content) > 1 {
 		n = len(content) - 1
@@ -681,23 +833,34 @@ func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (
 			idStrs[i] = id.Hex()
 		}
 	}
-	return opts, afterPtr, basePtr, idStrs
+	return opts, afterPtr, beforePtr, basePtr, idStrs
 }
 
 func (a *App) rememberAfterSeenLocked(lines []model.Line) {
 	m := make(map[string]string, len(lines))
+	before := make(map[string]string, len(lines))
 	base := make(map[string]string, len(lines))
 	for _, ln := range lines {
 		m[ln.ID.Hex()] = ln.Next.Hex()
+		before[ln.ID.Hex()] = ln.Prev.Hex()
 		base[ln.ID.Hex()] = ln.Content
 	}
 	a.afterSeen = m
+	a.beforeSeen = before
 	a.lineBase = base
+}
+
+func (a *App) requestTimeout() time.Duration {
+	if a.httpTimeout > 0 {
+		return a.httpTimeout
+	}
+	return 10 * time.Second
 }
 
 func (a *App) httpDo(method, path string, body []byte) (*http.Response, error) {
 	a.mu.Lock()
 	base := a.serverURL
+	timeout := a.requestTimeout()
 	a.mu.Unlock()
 	var rdr io.Reader
 	if body != nil {
@@ -710,7 +873,8 @@ func (a *App) httpDo(method, path string, body []byte) (*http.Response, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("无法连接服务器")
 	}

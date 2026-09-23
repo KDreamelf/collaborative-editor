@@ -37,21 +37,32 @@ func (d *Doc) SubmitSpanEdit(person string, opts SpanEditOpts) error {
 		}
 	}
 
-	// 已有跨度 live 且基准对齐：走 stale/promote，不在此用 base 行集合误拦结果段。
-	if live := d.live[key]; live != nil && len(live.baseIDs) >= 2 &&
-		sameIDs(live.baseIDs, baseIDs) && sameStrings(live.baseTexts, baseTexts) {
-		if afterSeen != live.oldNext {
-			return ErrSpanBase
+	// 已有跨度 live：原始基准对齐，或本人选中当前完整结果段（已同步）再改。
+	if live := d.live[key]; live != nil && len(live.baseIDs) >= 2 {
+		matchedOrigin := sameIDs(live.baseIDs, baseIDs) && sameStrings(live.baseTexts, baseTexts)
+		matchedResult := false
+		if live.person == person && afterSeen == live.oldNext {
+			resultIDs := append([]model.ID{first}, live.ids...)
+			if sameIDs(baseIDs, resultIDs) {
+				if cur, err := d.textsUntil(first, afterSeen); err == nil && sameStrings(cur, baseTexts) {
+					matchedResult = true
+				}
+			}
 		}
-		// 当前结果段（含可能的子行改动）已等于提交：保持正式链，零争议。
-		if cur, err := d.textsUntil(first, afterSeen); err == nil && sameStrings(cur, replacement) {
-			return nil
+		if matchedOrigin || matchedResult {
+			if matchedOrigin && afterSeen != live.oldNext {
+				return ErrSpanBase
+			}
+			// 当前结果段（含可能的子行改动）已等于提交：保持正式链，零争议。
+			if cur, err := d.textsUntil(first, afterSeen); err == nil && sameStrings(cur, replacement) {
+				return nil
+			}
+			if live.person == person {
+				d.detachFollow(person, first, model.ActionEdit)
+				return d.updateSpanLive(key, live, replacement, lineIDs)
+			}
+			return d.openStaleSpanDispute(person, baseIDs, baseTexts, replacement)
 		}
-		if live.person == person {
-			d.detachFollow(person, first, model.ActionEdit)
-			return d.updateSpanLive(key, live, replacement, lineIDs)
-		}
-		return d.openStaleSpanDispute(person, baseIDs, baseTexts, replacement)
 	}
 
 	// 插入/未决争议/不可折 live 早拒；可对位单行 live（含他人）放行，交 fold/提升争议。
@@ -214,10 +225,7 @@ func (d *Doc) spanBlocked(baseIDs []model.ID) error {
 			}
 			continue
 		}
-		if d.hasLiveInsert(id) || len(d.group(id, model.ActionInsert)) > 0 {
-			return ErrSpanBlocked
-		}
-		if d.insertHistory[id] != nil {
+		if d.hasInsertClaims(id) || d.hasInsertHistory(id) {
 			return ErrSpanBlocked
 		}
 		if i > 0 {
@@ -271,7 +279,7 @@ func (d *Doc) planLineLivesInSpan(baseIDs []model.ID, baseTexts []string) ([]lin
 		if err != nil {
 			return nil, ErrSpanBase
 		}
-		if d.hasLiveInsert(id) || len(d.group(id, model.ActionInsert)) > 0 || d.insertHistory[id] != nil {
+		if d.hasInsertClaims(id) || d.hasInsertHistory(id) {
 			return nil, ErrSpanBlocked
 		}
 		if ln.InsertOrigin != nil {
@@ -553,6 +561,7 @@ func (d *Doc) openStaleSpanDispute(person string, baseIDs []model.ID, baseTexts 
 		if id != first {
 			delete(d.live, claimKey{id, model.ActionEdit})
 			delete(d.live, claimKey{id, model.ActionInsert})
+			delete(d.live, claimKey{id, model.ActionInsertBefore})
 		}
 		for _, item := range append([]*model.Dispute(nil), d.group(id, model.ActionEdit)...) {
 			if item.RealLine != id {
@@ -597,10 +606,7 @@ func (d *Doc) planSpanPromote(seg *liveClaim) ([]promotePlan, error) {
 	first := seg.baseIDs[0]
 
 	for i, id := range resultIDs {
-		if d.hasLiveInsert(id) || len(d.group(id, model.ActionInsert)) > 0 {
-			return nil, ErrSpanBlocked
-		}
-		if d.insertHistory[id] != nil {
+		if d.hasInsertClaims(id) || d.hasInsertHistory(id) {
 			return nil, ErrSpanBlocked
 		}
 		ln := d.lines[id]
@@ -783,6 +789,96 @@ func (d *Doc) upsertSpan(person string, line model.ID, content []string, baseIDs
 	item := d.upsert(person, line, model.ActionEdit, content, false)
 	item.BaseIDs = append([]model.ID(nil), baseIDs...)
 	return item
+}
+
+// openSpanCovering 扫未决争议 BaseIDs，找覆盖 line 的开放跨度。
+// baseTexts 取自当前正式链（争议打开后正式链即共同基准）。
+func (d *Doc) openSpanCovering(line model.ID) (baseIDs []model.ID, baseTexts []string, index int, ok bool) {
+	for _, item := range d.disputes {
+		if item.Action != model.ActionEdit || len(item.BaseIDs) < 2 {
+			continue
+		}
+		idx := -1
+		for i, id := range item.BaseIDs {
+			if id == line {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			continue
+		}
+		texts := make([]string, len(item.BaseIDs))
+		for j, bid := range item.BaseIDs {
+			ln := d.lines[bid]
+			if ln == nil {
+				return nil, nil, 0, false
+			}
+			if j > 0 {
+				prev := d.lines[item.BaseIDs[j-1]]
+				if prev == nil || prev.Next != bid || ln.Prev != item.BaseIDs[j-1] {
+					return nil, nil, 0, false
+				}
+			}
+			texts[j] = ln.Content
+		}
+		return append([]model.ID(nil), item.BaseIDs...), texts, idx, true
+	}
+	return nil, nil, 0, false
+}
+
+// submitEditIntoOpenSpan：成员普通改 → 整段候选挂首行；不改正文、不抹他人。
+// 已有本人且长度=BaseIDs：从本人候选复制只改指定行（避免每次从 baseTexts 重建抹掉先前改动）。
+// 改回基准也按人 upsert，表达「保留原文」主张。
+// 首次多行粘贴：对基准全文 splice 成一份整段候选；已有本人不同长度无法对位 → 拒保全。
+func (d *Doc) submitEditIntoOpenSpan(person string, line model.ID, content []string, baseIDs []model.ID, baseTexts []string, index int) error {
+	if len(content) == 0 || index < 0 || index >= len(baseIDs) || len(baseIDs) != len(baseTexts) {
+		return ErrSpanBlocked
+	}
+	if _, err := d.line(line); err != nil {
+		return err
+	}
+	first := baseIDs[0]
+	own := d.byPerson(first, model.ActionEdit, person)
+	var candidate []string
+	if own != nil && sameIDs(own.BaseIDs, baseIDs) {
+		if len(own.Content) != len(baseIDs) {
+			// 本人已是扩/缩后的整段，无法把 BaseIDs[index] 对到候选下标。
+			return ErrSpanBlocked
+		}
+		if len(content) == 1 {
+			candidate = append([]string(nil), own.Content...)
+			candidate[index] = content[0]
+		} else {
+			candidate = spliceTexts(own.Content, index, content)
+		}
+	} else if own != nil && len(own.BaseIDs) > 0 && !sameIDs(own.BaseIDs, baseIDs) {
+		return ErrSpanBlocked
+	} else if len(content) == 1 {
+		candidate = append([]string(nil), baseTexts...)
+		candidate[index] = content[0]
+	} else {
+		candidate = spliceTexts(baseTexts, index, content)
+	}
+	d.detachFollow(person, first, model.ActionEdit)
+	d.upsertSpan(person, first, candidate, baseIDs)
+	return nil
+}
+
+func spliceTexts(base []string, index int, replacement []string) []string {
+	out := make([]string, 0, len(base)-1+len(replacement))
+	out = append(out, base[:index]...)
+	out = append(out, replacement...)
+	out = append(out, base[index+1:]...)
+	return out
+}
+
+// spanMemberStructuralBlock：未决跨度成员上的删/合并/跨度内插入等暂不能表达为候选 → 原子拒绝。
+func (d *Doc) spanMemberStructuralBlock(line model.ID) error {
+	if _, _, _, ok := d.openSpanCovering(line); ok {
+		return ErrSpanBlocked
+	}
+	return nil
 }
 
 func (d *Doc) applySpanWinner(person string, baseIDs []model.ID, content []string) error {

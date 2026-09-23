@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { formatUserError, httpFailureMessage, newLogId } from './errors'
 
 const STORAGE_KEY = 'admin-server-base'
@@ -36,6 +36,10 @@ const loading = ref(false)
 const articles = ref<ArticleSummary[]>([])
 const selectedId = ref<string | null>(null)
 const detail = ref<ArticleDetail | null>(null)
+const pageHeading = ref<HTMLElement | null>(null)
+let currentBase = DEFAULT_BASE
+let request = 0
+let controller: AbortController | null = null
 
 const suspendedSet = computed(() => new Set(detail.value?.suspended ?? []))
 
@@ -54,22 +58,37 @@ function normalizeBase(raw: string): string {
 }
 
 function loadBase() {
-  const saved = localStorage.getItem(STORAGE_KEY)
-  baseUrl.value = saved && saved.trim() ? saved : DEFAULT_BASE
+  try { baseUrl.value = localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE }
+  catch { baseUrl.value = DEFAULT_BASE }
 }
 
-function persistBase() {
+function persistBase(): boolean {
   const next = normalizeBase(baseUrl.value) || DEFAULT_BASE
+  try {
+    const url = new URL(next)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error()
+  } catch {
+    error.value = '请输入有效的服务器地址，例如 http://127.0.0.1:8787'
+    return false
+  }
+  if (next !== currentBase) {
+    selectedId.value = null
+    detail.value = null
+    articles.value = []
+  }
+  currentBase = next
   baseUrl.value = next
-  localStorage.setItem(STORAGE_KEY, next)
+  try { localStorage.setItem(STORAGE_KEY, next) } catch { /* 禁用本地存储不影响本次连接 */ }
+  return true
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  const url = `${normalizeBase(baseUrl.value)}${path}`
+async function apiGet<T>(path: string, signal: AbortSignal): Promise<T> {
+  const url = `${currentBase}${path}`
   let res: Response
   try {
-    res = await fetch(url)
+    res = await fetch(url, { signal })
   } catch (e) {
+    if (signal.aborted) throw e
     const id = newLogId()
     console.error(`[${id}]`, e)
     throw new Error('无法连接服务器')
@@ -88,25 +107,36 @@ async function apiGet<T>(path: string): Promise<T> {
 }
 
 async function refresh() {
-  persistBase()
+  controller?.abort()
+  const thisRequest = ++request
+  if (!persistBase()) { loading.value = false; return }
+  const abort = new AbortController()
+  controller = abort
+  const timeout = window.setTimeout(() => {
+    abort.abort()
+    if (thisRequest === request) error.value = '请求超时，请重试'
+  }, 10_000)
+  const selected = selectedId.value
   error.value = ''
   loading.value = true
   try {
-    if (selectedId.value) {
-      detail.value = await apiGet<ArticleDetail>(`/api/articles/${selectedId.value}`)
-      articles.value = await apiGet<ArticleSummary[]>('/api/articles')
-    } else {
-      articles.value = await apiGet<ArticleSummary[]>('/api/articles')
-      detail.value = null
-    }
+    const [list, article] = await Promise.all([
+      apiGet<ArticleSummary[]>('/api/articles', abort.signal),
+      selected ? apiGet<ArticleDetail>(`/api/articles/${selected}`, abort.signal) : Promise.resolve(null),
+    ])
+    if (thisRequest !== request) return
+    articles.value = list || []
+    detail.value = article
   } catch (e) {
-    error.value = formatUserError(e)
+    if (thisRequest === request && !abort.signal.aborted) error.value = formatUserError(e)
   } finally {
-    loading.value = false
+    window.clearTimeout(timeout)
+    if (thisRequest === request) loading.value = false
   }
 }
 
 async function openArticle(id: string) {
+  detail.value = null
   selectedId.value = id
   await refresh()
 }
@@ -125,9 +155,8 @@ function disputeContent(d: Dispute): string {
   return (d.content ?? []).join('\n')
 }
 
-watch(baseUrl, (v) => {
-  localStorage.setItem(STORAGE_KEY, normalizeBase(v) || DEFAULT_BASE)
-})
+async function focusHeading() { await nextTick(); pageHeading.value?.focus() }
+onBeforeUnmount(() => { ++request; controller?.abort() })
 
 onMounted(async () => {
   loadBase()
@@ -139,16 +168,19 @@ onMounted(async () => {
   <header class="topbar">
     <label>
       服务器
-      <input v-model="baseUrl" type="url" spellcheck="false" @change="persistBase" />
+      <input v-model="baseUrl" type="url" spellcheck="false" @keydown.enter="refresh" />
     </label>
     <button type="button" :disabled="loading" @click="refresh">
       {{ loading ? '刷新中…' : '刷新' }}
     </button>
   </header>
 
-  <p v-if="error" class="error">{{ error }}</p>
+  <p v-if="error" class="error" role="alert">{{ error }}</p>
 
-  <template v-if="!selectedId">
+  <Transition name="view" mode="out-in" @after-enter="focusHeading">
+  <section v-if="!selectedId" key="list" :aria-busy="loading">
+    <h1 ref="pageHeading" class="list-title" tabindex="-1">文档查看</h1>
+    <p v-if="loading" class="empty-state" role="status">正在加载文档…</p>
     <p v-if="!loading && articles.length === 0 && !error" class="empty-state">暂无文章</p>
     <ul class="list">
       <li v-for="a in articles" :key="a.id">
@@ -157,12 +189,12 @@ onMounted(async () => {
         </button>
       </li>
     </ul>
-  </template>
+  </section>
 
-  <template v-else>
+  <section v-else :key="selectedId" :aria-busy="loading">
     <div class="toolbar">
       <button type="button" @click="backToList">返回列表</button>
-      <h1>{{ detail?.article.title || '（无标题）' }}</h1>
+      <h1 ref="pageHeading" tabindex="-1">{{ detail?.article.title || (loading ? '正在打开文档…' : '文档暂不可用') }}</h1>
     </div>
 
     <div v-if="detail" class="article">
@@ -176,20 +208,22 @@ onMounted(async () => {
 
         <div v-if="lineDisputes(line.id).length" class="disputes">
           <div
-            v-for="d in lineDisputes(line.id)"
+            v-for="(d, candidate) in lineDisputes(line.id)"
             :key="d.id"
             class="dispute"
             :class="{ suspended: suspendedSet.has(d.id) }"
           >
             <div class="meta">
-              {{ d.person }} · {{ d.action }} · 追随者 {{ (d.followers ?? []).length }}
+              主张 {{ candidate + 1 }} · {{ d.action }}
+              <template v-if="d.followers?.length"> · {{ d.followers.length }} 人追随</template>
               <template v-if="suspendedSet.has(d.id)"> · 已挂起</template>
             </div>
             <div class="content">{{ disputeContent(d) }}</div>
           </div>
         </div>
       </div>
-      <p v-if="detail.lines.length === 0" class="empty-state">无正式行</p>
+      <p v-if="detail.lines.length === 0" class="empty-state">这篇文档还没有内容</p>
     </div>
-  </template>
+  </section>
+  </Transition>
 </template>

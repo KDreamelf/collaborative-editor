@@ -7,7 +7,7 @@
   --border: #ddd;
   --err-bg: #fff0f0;
   --err-fg: #a40000;
-  --dispute-bg: #f5f7fa;
+  --dispute-bg: #f1eee8;
   --accent: #2563eb;
   font: 14px/1.45 system-ui, 'Segoe UI', sans-serif;
   color: var(--fg);
@@ -23,7 +23,7 @@
     --border: #333;
     --err-bg: #2a1212;
     --err-fg: #ff8a8a;
-    --dispute-bg: #22262e;
+    --dispute-bg: #242320;
     --accent: #60a5fa;
   }
 }
@@ -47,7 +47,15 @@ input {
 
 button {
   cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out, border-color 160ms ease-out;
 }
+
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.list-title { margin: 24px 16px 12px; font-size: 20px; }
+.view-enter-active, .view-leave-active { transition: opacity 200ms cubic-bezier(.22,1,.36,1), transform 200ms cubic-bezier(.22,1,.36,1); }
+.view-enter-from, .view-leave-to { opacity: 0; transform: translateY(6px); }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
 
 .topbar {
   display: flex;
@@ -138,7 +146,7 @@ button {
 }
 
 .list button:hover {
-  background: var(--dispute-bg);
+  background: transparent;
 }
 
 .article {

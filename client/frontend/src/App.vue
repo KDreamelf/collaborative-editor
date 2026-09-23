@@ -1,369 +1,318 @@
 <script lang="ts" setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
-  AnswerFollow,
-  CreateArticle,
-  DismissUnsynced,
-  GetCachedArticle,
-  Join,
-  ListArticles,
-  ListUnsynced,
-  PersonID,
+  AnswerFollow, CreateArticle, DismissUnsynced, GetCachedArticle, GetSaveWarning,
+  GetServer, Join, ListArticles, ListUnsynced, PersonID, SetServer,
 } from '../wailsjs/go/main/App'
 import { main } from '../wailsjs/go/models'
 import { ClipboardSetText, EventsOn } from '../wailsjs/runtime/runtime'
 import SingleEditor from './components/SingleEditor.vue'
+import ModalDialog from './components/ModalDialog.vue'
 import { formatUserError } from './errors'
 import { buildVisualRows } from './layout'
-import { Cursor, FollowAsk, Snapshot } from './types'
-
-type ArticleBrief = main.ArticleBrief
-type CachedArticle = main.CachedArticle
-type UnsyncedItem = main.UnsyncedItem
+import type { Cursor, FollowAsk, FollowResult, Snapshot } from './types'
 
 const me = ref('')
 const name = ref('')
 const title = ref('')
-const articles = ref<ArticleBrief[]>([])
-const cached = ref<CachedArticle | null>(null)
-const unsynced = ref<UnsyncedItem[]>([])
+const articles = ref<main.ArticleBrief[]>([])
+const cached = ref<main.CachedArticle | null>(null)
+const unsynced = ref<main.UnsyncedItem[]>([])
 const showUnsynced = ref(false)
 const offline = ref(false)
 const joined = ref(false)
+const loading = ref(false)
+const busy = ref(false)
+const bridgeMissing = ref(false)
 const errorText = ref('')
+const notice = ref('')
+const saveWarning = ref('')
 const snap = ref<Snapshot | null>(null)
 const cursors = ref<Cursor[]>([])
-
+const activeID = ref('')
+const serverAddress = ref('')
+const serverDraft = ref('')
+const showServer = ref(false)
+const serverError = ref('')
+const asks = ref<FollowAsk[]>([])
+const showAsk = ref(false)
+const discard = ref<main.UnsyncedItem | null>(null)
+const editor = ref<InstanceType<typeof SingleEditor> | null>(null)
+const listHeading = ref<HTMLElement | null>(null)
 const rows = computed(() => buildVisualRows(snap.value, me.value))
+const ask = computed(() => asks.value[0])
+const unsubscribers: (() => void)[] = []
+let listRequest = 0
 
-function showError(e: unknown) {
-  errorText.value = formatUserError(e)
-}
+function showError(e: unknown) { errorText.value = formatUserError(e) }
 
-function loadArticles() {
-  ListArticles()
-    .then((list) => {
-      articles.value = list || []
-    })
-    .catch(showError)
-}
-
-function loadCached() {
-  GetCachedArticle()
-    .then((c) => {
-      cached.value = c || null
-      if (c && c.name && !name.value) name.value = c.name
-    })
-    .catch(() => {
-      cached.value = null
-    })
-}
-
-function loadUnsynced() {
-  ListUnsynced()
-    .then((list) => {
-      unsynced.value = list || []
-    })
-    .catch(() => {
-      unsynced.value = []
-    })
-}
-
-async function resumeCached() {
-  if (!cached.value) return
-  if (cached.value.name) name.value = cached.value.name
-  await enter(cached.value.id)
-}
-
-async function copyUnsynced(item: UnsyncedItem) {
-  const text = item.text || ''
+async function loadArticles() {
+  const request = ++listRequest
+  loading.value = true
   try {
-    const hasWailsClip =
-      typeof (window as unknown as { runtime?: { ClipboardSetText?: unknown } }).runtime
-        ?.ClipboardSetText === 'function'
-    if (hasWailsClip) {
-      const ok = await ClipboardSetText(text)
-      if (!ok) throw new Error('复制失败')
-      return
-    }
-    await navigator.clipboard.writeText(text)
+    const result = await ListArticles()
+    if (request === listRequest) articles.value = result || []
   } catch (e) {
-    showError(e)
+    if (request === listRequest) showError(e)
+  } finally {
+    if (request === listRequest) loading.value = false
   }
 }
-
-async function dismissUnsynced(id: string) {
-  if (!window.confirm('删除这份本地副本后将无法找回，确定删除？')) return
+async function loadCached() {
   try {
-    await DismissUnsynced(id)
-    loadUnsynced()
-  } catch (e) {
-    showError(e)
-  }
+    cached.value = await GetCachedArticle()
+    if (cached.value?.name && !name.value) name.value = cached.value.name
+  } catch (e) { showError(e) }
 }
-
-async function onCreate() {
-  try {
-    const id = await CreateArticle(title.value)
-    await enter(id)
-  } catch (e) {
-    showError(e)
-  }
+async function loadUnsynced() {
+  try { unsynced.value = (await ListUnsynced()) || [] }
+  catch (e) { showError(e) }
 }
-
 async function enter(id: string) {
+  if (busy.value) return
+  busy.value = true
+  activeID.value = id
+  errorText.value = ''
+  notice.value = ''
+  snap.value = null
+  cursors.value = []
+  asks.value = []
+  showAsk.value = false
   try {
-    await Join(id, name.value || '未命名')
+    await Join(id, name.value.trim() || '未命名')
     joined.value = true
-    errorText.value = ''
     cached.value = null
-    loadUnsynced()
+    await loadUnsynced()
   } catch (e) {
+    activeID.value = ''
     showError(e)
-  }
+  } finally { busy.value = false }
+}
+async function onCreate() {
+  if (busy.value) return
+  busy.value = true
+  errorText.value = ''
+  let id: string
+  try { id = await CreateArticle(title.value) }
+  catch (e) { showError(e); return }
+  finally { busy.value = false }
+  title.value = ''
+  await enter(id)
+}
+async function backToList() {
+  if (busy.value) return
+  busy.value = true
+  try {
+    await editor.value?.prepareLeave()
+    joined.value = false
+    activeID.value = ''
+    showUnsynced.value = false
+    showAsk.value = false
+    asks.value = []
+    errorText.value = ''
+    notice.value = ''
+    await Promise.all([loadArticles(), loadCached()])
+  } catch (e) { showError(e) }
+  finally { busy.value = false }
+}
+async function afterPageEnter() {
+  await nextTick()
+  if (joined.value) editor.value?.focus()
+  else listHeading.value?.focus()
+}
+function editServer() {
+  serverDraft.value = serverAddress.value
+  serverError.value = ''
+  showServer.value = true
+}
+async function saveServer() {
+  if (busy.value) return
+  busy.value = true
+  serverError.value = ''
+  try {
+    await SetServer(serverDraft.value)
+    serverAddress.value = await GetServer()
+    ++listRequest
+    articles.value = []
+    cached.value = null
+    snap.value = null
+    activeID.value = ''
+    errorText.value = ''
+    showServer.value = false
+    await Promise.all([loadArticles(), loadCached()])
+  } catch (e) { serverError.value = formatUserError(e) }
+  finally { busy.value = false }
+}
+async function copyUnsynced(item: main.UnsyncedItem) {
+  try {
+    const runtime = (window as unknown as { runtime?: { ClipboardSetText?: unknown } }).runtime
+    if (typeof runtime?.ClipboardSetText === 'function') {
+      if (!(await ClipboardSetText(item.text || ''))) throw new Error('复制失败，请选中原文手动复制')
+    } else {
+      await navigator.clipboard.writeText(item.text || '')
+    }
+    notice.value = '原文已复制'
+  } catch (e) { showError(e) }
+}
+async function dismissUnsynced() {
+  if (!discard.value || busy.value) return
+  busy.value = true
+  try {
+    await DismissUnsynced(discard.value.id)
+    discard.value = null
+    await loadUnsynced()
+  } catch (e) { showError(e) }
+  finally { busy.value = false }
+}
+async function answerFollow(accept: boolean) {
+  const current = ask.value
+  if (!current || busy.value) return
+  busy.value = true
+  try {
+    await AnswerFollow(current.fromId, current.disputeId, accept)
+    asks.value = asks.value.filter((a) => a !== current)
+    showAsk.value = asks.value.length > 0
+    notice.value = accept ? '已同意追随' : '已拒绝追随'
+  } catch (e) { showError(e) }
+  finally { busy.value = false }
 }
 
 onMounted(async () => {
-  // 生产包剔除整段；仅 DEV + ?mock=1 动态拉演示数据
-  if (import.meta.env.DEV && /(?:\?|&)mock=1(?:&|$)/.test(location.search)) {
-    const { loadDevMock } = await import('./devMock')
-    const m = loadDevMock()
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') {
+    const m = (await import('./devMock')).loadDevMock()
     me.value = m.me
     joined.value = true
+    activeID.value = m.snap.article.id
     snap.value = m.snap
     cursors.value = m.cursors
     return
   }
-  me.value = await PersonID()
-  loadArticles()
-  loadCached()
-  loadUnsynced()
-  EventsOn('snapshot', (s: Snapshot) => {
-    snap.value = s
-    if (s && s.cursors) cursors.value = s.cursors
-  })
-  EventsOn('cursors', (cs: Cursor[]) => {
-    cursors.value = cs || []
-  })
-  EventsOn('unsynced', (list: UnsyncedItem[]) => {
-    unsynced.value = list || []
-  })
-  EventsOn('offline', (on: boolean) => {
-    offline.value = !!on
-  })
-  EventsOn('followAsk', async (ask: FollowAsk) => {
-    const ok = window.confirm(`${ask.fromName || '有人'}想追随你的主张，点头？`)
-    try {
-      await AnswerFollow(ask.fromId, ask.disputeId, ok)
-    } catch (e) {
-      showError(e)
-    }
-  })
-  EventsOn('followResult', () => {})
-  EventsOn('error', (msg: string) => {
-    showError(msg)
-  })
+  // 先订阅，再读取状态，避免漏掉初始化期间的离线或保存事件。
+  if (!(window as unknown as { go?: { main?: { App?: unknown } } }).go?.main?.App) {
+    bridgeMissing.value = true
+    return
+  }
+  unsubscribers.push(
+    EventsOn('snapshot', (s: Snapshot) => {
+      if (s.article.id !== activeID.value) return
+      snap.value = s
+      cursors.value = s.cursors || []
+      asks.value = asks.value.filter((a) => s.disputes.some((d) => d.id === a.disputeId &&
+        d.pendingConfirm?.some((p) => p.from === a.fromId && p.to === me.value)))
+      if (!asks.value.length) showAsk.value = false
+    }),
+    EventsOn('cursors', (cs: Cursor[]) => { if (activeID.value) cursors.value = cs || [] }),
+    EventsOn('unsynced', (list: main.UnsyncedItem[]) => { unsynced.value = list || [] }),
+    EventsOn('offline', (on: boolean) => { offline.value = !!on }),
+    EventsOn('saveWarning', (warning: string) => { saveWarning.value = warning || '' }),
+    EventsOn('followAsk', (incoming: FollowAsk) => {
+      if (!activeID.value || !snap.value?.disputes.some((d) => d.id === incoming.disputeId)) return
+      if (!asks.value.some((a) => a.fromId === incoming.fromId && a.disputeId === incoming.disputeId)) asks.value.push(incoming)
+    }),
+    EventsOn('followResult', (result: FollowResult) => {
+      notice.value = ({ pending: '追随请求已送出，等待对方确认', applied: '追随已生效',
+        denied: '对方未接受追随，你的主张仍保留', lost: '对方的追随先发出，已同步结果，请重新选择' } as Record<string, string>)[result.status] || ''
+    }),
+    EventsOn('error', showError),
+  )
+  try {
+    me.value = await PersonID()
+    serverAddress.value = await GetServer()
+    saveWarning.value = await GetSaveWarning()
+    await Promise.all([loadArticles(), loadCached(), loadUnsynced()])
+  } catch (e) { showError(e) }
 })
+onBeforeUnmount(() => { ++listRequest; unsubscribers.forEach((off) => off()) })
 </script>
 
 <template>
-  <div v-if="!joined" class="lobby">
-    <h1>协同编辑器</h1>
-    <label>
-      名字
-      <input v-model="name" placeholder="未命名" autocomplete="off" />
-    </label>
-    <div v-if="cached" class="resume">
-      <p>
-        上次的「{{ cached.title }}」还留在本机
-        <template v-if="cached.pendingCount">，有 {{ cached.pendingCount }} 处待发送</template>
-        <template v-if="cached.unsyncedCount">，有 {{ cached.unsyncedCount }} 处未能同步</template>
-      </p>
-      <button type="button" @click="resumeCached">继续编辑</button>
-    </div>
-    <div class="create">
-      <input v-model="title" placeholder="新文档标题" autocomplete="off" />
-      <button type="button" @click="onCreate">新建</button>
-    </div>
-    <h2>已有文档</h2>
-    <ul class="alist">
-      <li v-for="a in articles" :key="a.id">
-        <button type="button" class="link" @click="enter(a.id)">{{ a.title || '未命名文档' }}</button>
-      </li>
-    </ul>
-    <p v-if="errorText" class="err">{{ errorText }}</p>
-  </div>
-
-  <div v-else class="editor-shell">
-    <header class="bar">
-      <span>{{ snap?.article?.title || cached?.title || '文档' }}</span>
-      <span v-if="offline" class="offline-hint">当前离线，改动会在连上后自动发送</span>
-      <button
-        v-if="unsynced.length"
-        type="button"
-        class="unsync-btn"
-        @click="showUnsynced = !showUnsynced"
-      >
-        {{ unsynced.length }} 处未能同步
-      </button>
-      <span v-if="errorText" class="err">{{ errorText }}</span>
-    </header>
-    <div v-if="showUnsynced && unsynced.length" class="unsync-panel">
-      <div v-for="u in unsynced" :key="u.id" class="unsync-item">
-        <p class="unsync-sum">{{ u.summary }}</p>
-        <pre class="unsync-text">{{ u.text || '（无文字）' }}</pre>
-        <div class="unsync-actions">
-          <button type="button" @click="copyUnsynced(u)">复制原文</button>
-          <button type="button" class="ghost" @click="dismissUnsynced(u.id)">删除本地副本</button>
-        </div>
-      </div>
-    </div>
-    <SingleEditor :rows="rows" :me="me" :cursors="cursors" @error="showError" />
-  </div>
+  <Transition name="page" mode="out-in" @after-enter="afterPageEnter">
+    <main v-if="bridgeMissing" key="preview" class="lobby">
+      <h1>协同编辑器</h1><p class="muted">请从桌面客户端打开编辑器，以连接文档并保存修改。</p>
+    </main>
+    <main v-else-if="!joined" key="lobby" class="lobby">
+      <header class="lobby-heading">
+        <h1 ref="listHeading" tabindex="-1">协同编辑器</h1>
+        <button class="quiet" :disabled="busy" @click="editServer">连接设置</button>
+      </header>
+      <label class="field">名字<input v-model="name" placeholder="未命名" autocomplete="nickname" :disabled="busy" /></label>
+      <section v-if="cached" class="resume">
+        <p>继续「{{ cached.title || '未命名文档' }}」</p>
+        <p v-if="cached.pendingCount || cached.unsyncedCount" class="muted">{{ cached.pendingCount || 0 }} 处待发送，{{ cached.unsyncedCount || 0 }} 处未能同步</p>
+        <button :disabled="busy" @click="enter(cached.id)">继续编辑</button>
+      </section>
+      <form class="create" @submit.prevent="onCreate">
+        <input v-model="title" aria-label="新文档标题" placeholder="新文档标题" :disabled="busy" />
+        <button :disabled="busy">{{ busy ? '请稍候…' : '新建' }}</button>
+      </form>
+      <div class="list-heading"><h2>已有文档</h2><button class="quiet" :disabled="loading || busy" @click="errorText = ''; loadArticles()">刷新</button></div>
+      <p v-if="loading" class="muted" role="status">正在加载文档…</p>
+      <p v-else-if="!articles.length && !errorText" class="muted">还没有文档，可以从新建开始。</p>
+      <ul class="article-list" :aria-busy="loading">
+        <li v-for="a in articles" :key="a.id"><button class="article-link" :disabled="busy" @click="enter(a.id)">{{ a.title || '未命名文档' }}<span aria-hidden="true">↗</span></button></li>
+      </ul>
+      <p v-if="errorText" class="error" role="alert">{{ errorText }}</p>
+      <p v-if="saveWarning" class="warning" role="status">{{ saveWarning }}</p>
+    </main>
+    <main v-else key="editor" class="editor-shell">
+      <header class="bar">
+        <button class="quiet" :disabled="busy" @click="backToList">返回文档</button>
+        <strong class="document-title">{{ snap?.article.title || '正在打开文档…' }}</strong>
+        <span v-if="offline" class="muted" role="status">当前离线，连接后自动发送</span>
+        <button v-if="asks.length" @click="showAsk = true">{{ asks.length }} 个追随请求</button>
+        <button v-if="unsynced.length" class="quiet" :aria-expanded="showUnsynced" @click="showUnsynced = !showUnsynced">{{ unsynced.length }} 处未能同步</button>
+      </header>
+      <p v-if="saveWarning" class="banner warning" role="status">{{ saveWarning }}</p>
+      <p v-if="errorText" class="banner error" role="alert">{{ errorText }}<button class="quiet" aria-label="关闭提示" @click="errorText = ''">×</button></p>
+      <p v-if="notice" class="banner muted" role="status">{{ notice }}<button class="quiet" aria-label="关闭通知" @click="notice = ''">×</button></p>
+      <Transition name="panel">
+        <section v-if="showUnsynced && unsynced.length" class="unsynced-panel" aria-label="未同步修改">
+          <article v-for="u in unsynced" :key="u.id">
+            <p>{{ u.summary }}</p><pre>{{ u.text || '（无文字）' }}</pre>
+            <div class="actions"><button @click="copyUnsynced(u)">复制原文</button><button class="quiet" @click="discard = u">删除本地副本</button></div>
+          </article>
+        </section>
+      </Transition>
+      <SingleEditor v-if="snap" ref="editor" :key="activeID" :rows="rows" :me="me" :cursors="cursors" :initial-line-id="snap.yourLine" @error="showError" />
+      <p v-else class="loading" role="status">正在打开文档…</p>
+    </main>
+  </Transition>
+  <ModalDialog v-model="showServer" title="连接设置" :busy="busy">
+    <form @submit.prevent="saveServer">
+      <label class="field">服务器地址<input v-model="serverDraft" type="url" required autofocus placeholder="http://127.0.0.1:8787" :disabled="busy" /></label>
+      <p v-if="serverError" class="error" role="alert">{{ serverError }}</p>
+      <div class="actions"><button :disabled="busy">{{ busy ? '正在保存…' : '保存' }}</button><button type="button" class="quiet" :disabled="busy" @click="showServer = false">取消</button></div>
+    </form>
+  </ModalDialog>
+  <ModalDialog v-model="showAsk" title="追随请求" :busy="busy">
+    <template v-if="ask"><p>{{ ask.fromName || '有人' }} 希望接受你的主张，是否同意？</p><div class="actions"><button :disabled="busy" @click="answerFollow(true)">同意</button><button class="quiet" :disabled="busy" @click="answerFollow(false)">拒绝</button><button class="quiet" :disabled="busy" @click="showAsk = false">稍后</button></div></template>
+  </ModalDialog>
+  <ModalDialog :model-value="!!discard" title="删除本地副本" :busy="busy" @update:model-value="discard = null">
+    <p>删除后将无法找回，请先确认已复制需要的内容。</p><div class="actions"><button class="quiet" :disabled="busy" autofocus @click="discard = null">保留</button><button :disabled="busy" @click="dismissUnsynced">删除副本</button></div>
+  </ModalDialog>
 </template>
 
 <style scoped>
-.lobby {
-  max-width: 420px;
-  margin: 40px auto;
-  padding: 16px;
-  text-align: left;
-  color: #1a1a1a;
-}
-.lobby h1 {
-  font-size: 1.4rem;
-  margin: 0 0 16px;
-}
-.lobby label {
-  display: block;
-  margin-bottom: 12px;
-}
-.lobby input {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  box-sizing: border-box;
-  padding: 8px 10px;
-  border: 1px solid #ddd6c8;
-  border-radius: 4px;
-  background: #fff;
-  color: #1a1a1a;
-}
-.create {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 20px;
-}
-.create input {
-  flex: 1;
-  margin-top: 0;
-}
-.create button,
-.alist .link {
-  border: none;
-  border-radius: 4px;
-  padding: 8px 12px;
-  background: #3d7eff;
-  color: #fff;
-  cursor: pointer;
-}
-.alist {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-.alist li {
-  margin: 6px 0;
-}
-.alist .link {
-  background: transparent;
-  color: #9ec1ff;
-  padding: 4px 0;
-}
-.err {
-  color: #ff8a80;
-  font-size: 0.9rem;
-}
-.resume {
-  margin-bottom: 16px;
-  padding: 10px 12px;
-  border: 1px solid #ddd6c8;
-  border-radius: 4px;
-  background: #fff8e8;
-}
-.resume p {
-  margin: 0 0 8px;
-  font-size: 0.95rem;
-}
-.resume button,
-.unsync-btn,
-.unsync-actions button {
-  border: none;
-  border-radius: 4px;
-  padding: 6px 10px;
-  background: #3d7eff;
-  color: #fff;
-  cursor: pointer;
-}
-.unsync-btn {
-  margin-left: 12px;
-  background: #c47b00;
-  font-size: 0.85rem;
-}
-.offline-hint {
-  margin-left: 12px;
-  color: #c47b00;
-  font-size: 0.85rem;
-}
-.unsync-panel {
-  padding: 8px 12px;
-  background: #fff8e8;
-  border-bottom: 1px solid #e6d9b8;
-  max-height: 40vh;
-  overflow: auto;
-}
-.unsync-item {
-  margin-bottom: 10px;
-}
-.unsync-sum {
-  margin: 0 0 4px;
-  font-size: 0.9rem;
-}
-.unsync-text {
-  margin: 0 0 6px;
-  padding: 8px;
-  background: #fff;
-  border: 1px solid #eee;
-  border-radius: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font: inherit;
-  color: #1a1a1a;
-}
-.unsync-actions {
-  display: flex;
-  gap: 8px;
-}
-.unsync-actions .ghost {
-  background: transparent;
-  color: #666;
-  border: 1px solid #ccc;
-}
-.editor-shell {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  text-align: left;
-  color: #1a1a1a;
-  background: #f7f5f0;
-}
-.bar {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  background: #ece8df;
-  border-bottom: 1px solid #ddd6c8;
-  font-size: 0.9rem;
-}
+.lobby { max-width: 620px; margin: 0 auto; padding: 48px 24px; }
+.lobby-heading, .list-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+h1 { font-size: 1.6rem; margin: 0; letter-spacing: -.03em; }
+h2 { font-size: 1rem; margin: 0; }
+.lobby-heading { margin-bottom: 32px; }
+.resume { margin: 20px 0; padding: 18px; background: #eeebe4; border-radius: 8px; }
+.resume p:first-child { margin-top: 0; }
+.create { display: flex; gap: 10px; margin: 24px 0 32px; }
+.create input { flex: 1; min-width: 0; }
+.article-list { list-style: none; padding: 0; margin: 12px 0; }
+.article-link { display: flex; justify-content: space-between; gap: 16px; width: 100%; padding: 14px 0; border: 0; border-bottom: 1px solid #e4dfd5; border-radius: 0; text-align: left; background: transparent; color: inherit; overflow-wrap: anywhere; }
+.article-link:hover { background: #eeebe4; }
+.article-link span { color: #888; }
+.editor-shell { display: flex; flex-direction: column; height: 100%; }
+.bar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 16px; background: #ece8df; border-bottom: 1px solid #ddd6c8; }
+.document-title { flex: 1; min-width: 120px; overflow-wrap: anywhere; font-size: .95rem; }
+.banner { margin: 0; padding: 8px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; background: #f0ece3; font-size: .9rem; }
+.unsynced-panel { padding: 16px 24px; background: #eeebe4; max-height: 40vh; overflow: auto; }
+.unsynced-panel article + article { margin-top: 24px; padding-top: 12px; border-top: 1px solid #d8d2c7; }
+pre { padding: 12px; background: #faf8f3; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.loading { padding: 24px; }
+@media (max-width: 540px) { .lobby { padding: 24px 16px; } .bar { gap: 8px; } .document-title { order: -1; flex-basis: 100%; } }
 </style>

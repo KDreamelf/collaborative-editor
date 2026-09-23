@@ -2,6 +2,7 @@ import {
   ACTION_DELETE,
   ACTION_EDIT,
   ACTION_INSERT,
+  ACTION_INSERT_BEFORE,
   DELETE_LABEL,
   Dispute,
   Snapshot,
@@ -167,15 +168,16 @@ function pushInsertBlocks(
   me: string,
   suspended: Set<string>,
   zebra: number,
+  action = ACTION_INSERT,
 ) {
   for (const d of inserts) {
-    remember(lineId, ACTION_INSERT, d.person)
+    remember(lineId, action, d.person)
   }
   const vis = visibleClaims(inserts, me)
   let self = vis.find((d) => d.person === me)
   const others = sortBySeen(
     lineId,
-    ACTION_INSERT,
+    action,
     vis.filter((d) => d.person !== me).map((d) => d.person),
   )
     .map((pid) => vis.find((d) => d.person === pid)!)
@@ -185,7 +187,7 @@ function pushInsertBlocks(
     self = {
       id: '',
       realLine: lineId,
-      action: ACTION_INSERT,
+      action,
       person: me,
       content: [],
       followers: [],
@@ -194,13 +196,14 @@ function pushInsertBlocks(
   const ordered = stackAroundSelf(others, self)
 
   ordered.forEach((d, claimIdx) => {
+    const blockStart = out.length
     const isSelf = d.person === me
     const phantom = !d.id
     const insertParts = phantom ? [] : d.content && d.content.length > 0 ? d.content : ['']
 
     // 共同首行：正式锚点正文
     out.push({
-      key: isSelf ? `line:${lineId}` : `insert-ctx:${d.id}`,
+      key: `insert-ctx:${action}:${lineId}:${d.person}`,
       lineId,
       lineIndex,
       action: ACTION_EDIT,
@@ -213,6 +216,7 @@ function pushInsertBlocks(
       partCount: 1,
       isSelf,
       isContext: true,
+      contextAction: action,
       showLineNo: isSelf,
       lineNo,
       followerCount: (d.followers || []).length,
@@ -230,7 +234,7 @@ function pushInsertBlocks(
         key: `${d.id}:${partIndex}`,
         lineId,
         lineIndex,
-        action: ACTION_INSERT,
+        action,
         disputeId: d.id,
         followId: isSelf ? '' : d.id,
         personId: d.person,
@@ -251,6 +255,18 @@ function pushInsertBlocks(
         separatorBefore: false,
       })
     })
+    if (action === ACTION_INSERT_BEFORE && insertParts.length) {
+      const block = out.splice(blockStart)
+      const context = block.shift()!
+      block.push(context)
+      block.forEach((row, index) => {
+        row.blockStart = index === 0
+        row.separatorBefore = index === 0 && claimIdx > 0
+        row.showLineNo = index === 0 && isSelf
+        row.gutterDots = index === 0 && !isSelf ? dotIds(d) : []
+      })
+      out.push(...block)
+    }
   })
 }
 
@@ -284,10 +300,17 @@ export function buildVisualRows(snap: Snapshot | null, me: string): VisualRow[] 
 
     const lineNo = lineIndex + 1
     const zebra = lineIndex % 2
-    const body = disputes.filter((d) => d.realLine === line.id && isBodyAction(d.action))
+    let body = disputes.filter((d) => d.realLine === line.id && isBodyAction(d.action))
     const inserts = disputes.filter((d) => d.realLine === line.id && d.action === ACTION_INSERT)
+    const before = disputes.filter((d) => d.realLine === line.id && d.action === ACTION_INSERT_BEFORE)
+    // 本人挂起且等于正文的单份编辑已包含在插入上下文里，不再重复画一遍。
+    if ((inserts.length || before.length) && body.length === 1 && body[0].person === me &&
+      body[0].action === ACTION_EDIT && body[0].content.length === 1 && body[0].content[0] === line.content) body = []
     const spanBaseIDs = body.find((d) => d.baseIDs && d.baseIDs.length >= 2)?.baseIDs
 
+    if (before.length > 0) {
+      pushInsertBlocks(out, line.id, lineIndex, lineNo, line.content || '', before, me, suspended, zebra, ACTION_INSERT_BEFORE)
+    }
     if (body.length > 0) {
       let ordered = arrange(line.id, ACTION_EDIT, body, me)
       if (!ordered.some((d) => d.person === me)) {
@@ -318,7 +341,7 @@ export function buildVisualRows(snap: Snapshot | null, me: string): VisualRow[] 
         zebra,
         spanBaseIDs,
       )
-    } else if (inserts.length === 0) {
+    } else if (inserts.length === 0 && before.length === 0) {
       out.push({
         key: `line:${line.id}`,
         lineId: line.id,

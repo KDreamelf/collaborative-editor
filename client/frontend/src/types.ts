@@ -19,6 +19,7 @@ export interface Dispute {
   /** 跨多条正式行的整段「改这行」：原跨度各正式行 ID，首项即 realLine */
   baseIDs?: string[]
   followers: string[]
+  pendingConfirm?: { from: string; to: string; clientTs: number }[]
 }
 
 export interface Person {
@@ -31,6 +32,10 @@ export interface Cursor {
   name: string
   lineId: string
   disputeId?: string
+  partIndex?: number
+  selEndLineId?: string
+  selEndDisputeId?: string
+  selEndPartIndex?: number
   offset: number
   selEnd: number
 }
@@ -76,6 +81,8 @@ export interface VisualRow {
   isSelf: boolean
   /** 插入块内复用正式行正文的首行 */
   isContext: boolean
+  /** 上下文可编辑正文，但注意力属于对应方向的插入主张。 */
+  contextAction?: string
   showLineNo: boolean
   lineNo: number
   followerCount: number
@@ -95,6 +102,10 @@ export interface VisualRow {
 
 export const ACTION_EDIT = '改这行'
 export const ACTION_INSERT = '插在后面'
+export const ACTION_INSERT_BEFORE = '插在前面'
+export function isInsertAction(action: string): boolean {
+  return action === ACTION_INSERT || action === ACTION_INSERT_BEFORE
+}
 export const ACTION_DELETE = '删这行'
 export const DELETE_LABEL = '删除此行'
 
