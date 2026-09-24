@@ -30,9 +30,9 @@ export function MoveCaretRange(arg1:string,arg2:string,arg3:number,arg4:number,a
 
 export function PersonID():Promise<string>;
 
-export function ReportError(arg1:string,arg2:string):Promise<void>;
-
 export function RejectClaim(arg1:string):Promise<void>;
+
+export function ReportError(arg1:string,arg2:string):Promise<void>;
 
 export function RequestFollow(arg1:string):Promise<void>;
 

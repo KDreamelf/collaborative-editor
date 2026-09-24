@@ -1,13 +1,13 @@
 export namespace main {
-
+	
 	export class ArticleBrief {
 	    id: string;
 	    title: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ArticleBrief(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -20,11 +20,11 @@ export namespace main {
 	    name: string;
 	    pendingCount: number;
 	    unsyncedCount: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new CachedArticle(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -38,11 +38,11 @@ export namespace main {
 	    id: string;
 	    text: string;
 	    summary: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new UnsyncedItem(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -52,3 +52,4 @@ export namespace main {
 	}
 
 }
+

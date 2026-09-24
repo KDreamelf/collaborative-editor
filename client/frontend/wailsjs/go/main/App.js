@@ -58,12 +58,12 @@ export function PersonID() {
   return window['go']['main']['App']['PersonID']();
 }
 
-export function ReportError(arg1, arg2) {
-  return window['go']['main']['App']['ReportError'](arg1, arg2);
-}
-
 export function RejectClaim(arg1) {
   return window['go']['main']['App']['RejectClaim'](arg1);
+}
+
+export function ReportError(arg1, arg2) {
+  return window['go']['main']['App']['ReportError'](arg1, arg2);
 }
 
 export function RequestFollow(arg1) {
