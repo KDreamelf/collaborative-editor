@@ -103,7 +103,6 @@ func TestReceiveOrdinaryInsertActiveDiffReturnsOwnCC(t *testing.T) {
 	anchor := model.NewID()
 	claimID := model.NewID()
 	d := loadDoc(t, []model.Line{{ID: anchor, Content: "锚"}}, nil)
-	before := docSnap(t, d)
 
 	got, err := receiveOrdinaryInsert(d, "甲", anchor.Hex(), true,
 		insertOp("乙", anchor.Hex(), model.ActionInsert, []string{"对方段"}, []string{model.NewID().Hex()}, strPtr(""), nil),
@@ -111,18 +110,12 @@ func TestReceiveOrdinaryInsertActiveDiffReturnsOwnCC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("View 应不变")
+	if got != nil {
+		t.Fatalf("插入不发主张: %+v", got)
 	}
-	if len(mustView(t, d).Disputes) != 0 {
-		t.Fatal("不得进争议")
-	}
-	if got == nil {
-		t.Fatal("期望本人 CC")
-	}
-	if got.TargetPersonID != "乙" || got.Claim.Person != "甲" || got.Claim.ID != claimID ||
-		got.Claim.Action != model.ActionInsert || got.Claim.RealLine != anchor || len(got.Claim.Content) != 0 {
-		t.Fatalf("cc=%+v", got)
+	v := mustView(t, d)
+	if len(v.Disputes) != 0 || len(v.Lines) != 2 || v.Lines[1].Content != "对方段" {
+		t.Fatalf("应直接插入: %+v disputes=%+v", v.Lines, v.Disputes)
 	}
 }
 
@@ -130,7 +123,6 @@ func TestReceiveOrdinaryInsertActiveDiffBeforeRealLine(t *testing.T) {
 	below := model.NewID()
 	claimID := model.NewID()
 	d := loadDoc(t, []model.Line{{ID: below, Content: "下行"}}, nil)
-	before := docSnap(t, d)
 
 	got, err := receiveOrdinaryInsert(d, "甲", below.Hex(), true,
 		insertOp("乙", below.Hex(), model.ActionInsertBefore, []string{"对方"}, []string{model.NewID().Hex()}, nil, strPtr("")),
@@ -138,11 +130,12 @@ func TestReceiveOrdinaryInsertActiveDiffBeforeRealLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("Doc 应不变")
+	if got != nil {
+		t.Fatalf("前插不发主张: %+v", got)
 	}
-	if got == nil || got.Claim.Action != model.ActionInsertBefore || got.Claim.RealLine != below {
-		t.Fatalf("前插 CC RealLine 须指下行: %+v", got)
+	v := mustView(t, d)
+	if len(v.Lines) != 2 || v.Lines[0].Content != "对方" || v.Lines[1].ID != below {
+		t.Fatalf("应插在下行前: %+v", v.Lines)
 	}
 }
 
@@ -157,7 +150,6 @@ func TestReceiveOrdinaryInsertActiveMultilineOwnContent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	before := docSnap(t, d)
 	claimID := model.NewID()
 
 	got, err := receiveOrdinaryInsert(d, "甲", anchor.Hex(), true,
@@ -166,11 +158,17 @@ func TestReceiveOrdinaryInsertActiveMultilineOwnContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("Doc 应不变")
+	if got != nil {
+		t.Fatalf("插入不发主张: %+v", got)
 	}
-	if got == nil || !slices.Equal(got.Claim.Content, []string{"我1", "我2"}) {
-		t.Fatalf("CC.Content 须完整多行: %+v", got)
+	found := false
+	for _, ln := range mustView(t, d).Lines {
+		if ln.Content == "对方" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("应写入对方插入")
 	}
 }
 
@@ -193,7 +191,6 @@ func TestReceiveOrdinaryInsertActiveStackedCAContent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	before := docSnap(t, d)
 	claimID := model.NewID()
 
 	got, err := receiveOrdinaryInsert(d, "丙", anchor.Hex(), true,
@@ -202,11 +199,17 @@ func TestReceiveOrdinaryInsertActiveStackedCAContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("Doc 应不变")
+	if got != nil {
+		t.Fatalf("插入不发主张: %+v", got)
 	}
-	if got == nil || !slices.Equal(got.Claim.Content, []string{"C", "A"}) {
-		t.Fatalf("CC.Content 须完整 C+A: %+v", got)
+	found := false
+	for _, ln := range mustView(t, d).Lines {
+		if ln.Content == "D" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("应写入 D")
 	}
 }
 
@@ -223,7 +226,6 @@ func TestReceiveOrdinaryInsertActiveObserverSyncedA(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	before := docSnap(t, d)
 	claimID := model.NewID()
 
 	got, err := receiveOrdinaryInsert(d, "观察者", anchor.Hex(), true,
@@ -232,11 +234,17 @@ func TestReceiveOrdinaryInsertActiveObserverSyncedA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("Doc 应不变")
+	if got != nil {
+		t.Fatalf("插入不发主张: %+v", got)
 	}
-	if got == nil || !slices.Equal(got.Claim.Content, []string{"A"}) {
-		t.Fatalf("观察者已同步 A，CC 不得空: %+v", got)
+	found := false
+	for _, ln := range mustView(t, d).Lines {
+		if ln.Content == "D" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("应写入 D")
 	}
 }
 
@@ -257,7 +265,6 @@ func TestReceiveOrdinaryInsertActiveBeforeStackedAC(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	before := docSnap(t, d)
 	claimID := model.NewID()
 
 	got, err := receiveOrdinaryInsert(d, "丙", head.Hex(), true,
@@ -266,12 +273,17 @@ func TestReceiveOrdinaryInsertActiveBeforeStackedAC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("Doc 应不变")
+	if got != nil {
+		t.Fatalf("前插不发主张: %+v", got)
 	}
-	if got == nil || got.Claim.Action != model.ActionInsertBefore ||
-		!slices.Equal(got.Claim.Content, []string{"A", "C"}) {
-		t.Fatalf("前插 CC 须完整 A+C: %+v", got)
+	found := false
+	for _, ln := range mustView(t, d).Lines {
+		if ln.Content == "D" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("应写入 D")
 	}
 }
 
@@ -283,8 +295,6 @@ func TestReceiveOrdinaryInsertExistingForeignCandidateKeepsDoc(t *testing.T) {
 		{ID: ownID, RealLine: anchor, Action: model.ActionInsert, Person: "甲", Content: []string{"我的候选"}},
 		{ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "乙", Content: []string{"外来候选"}},
 	})
-	before := docSnap(t, d)
-
 	got, err := receiveOrdinaryInsert(d, "甲", "", false,
 		insertOp("丙", anchor.Hex(), model.ActionInsert, []string{"普通包"}, []string{model.NewID().Hex()}, strPtr(""), nil),
 		model.NewID())
@@ -294,8 +304,18 @@ func TestReceiveOrdinaryInsertExistingForeignCandidateKeepsDoc(t *testing.T) {
 	if got != nil {
 		t.Fatalf("不应 CC: %+v", got)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("已有外来候选时普通包不得改 Doc")
+	v := mustView(t, d)
+	if len(v.Disputes) != 2 {
+		t.Fatalf("主张应留着: %+v", v.Disputes)
+	}
+	found := false
+	for _, ln := range v.Lines {
+		if ln.Content == "普通包" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("应写入普通插入")
 	}
 }
 

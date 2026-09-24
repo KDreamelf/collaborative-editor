@@ -345,24 +345,8 @@ func TestRebuildFromChainAndClaimsNilLocalUsesServerChain(t *testing.T) {
 	if len(v.Lines) != 1 || v.Lines[0].Content != "他" {
 		t.Fatalf("正式链: %+v", v.Lines)
 	}
-	var own, foreign *model.Dispute
-	for i := range v.Disputes {
-		d := &v.Disputes[i]
-		switch d.Person {
-		case "甲":
-			own = d
-		case "乙":
-			foreign = d
-		}
-	}
-	if own == nil || foreign == nil {
-		t.Fatalf("缺本人或他人: %+v", v.Disputes)
-	}
-	if !slices.Equal(own.Content, []string{"他"}) {
-		t.Fatalf("无 local 本人取服务器链: %+v", own)
-	}
-	if foreign.ID != foreignID || !slices.Equal(foreign.Content, []string{"他"}) {
-		t.Fatalf("他人候选: %+v", foreign)
+	if len(v.Disputes) != 1 || v.Disputes[0].ID != foreignID || v.Disputes[0].Person != "乙" {
+		t.Fatalf("无本人主张时只保留服务器记录: %+v", v.Disputes)
 	}
 }
 

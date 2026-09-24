@@ -10,7 +10,8 @@ import (
 
 // rebuildFromChainAndClaims 用服务器当前共享链 + 显式主张重建本端 Doc。
 // 纯函数：不改入参 local / claimIDs；入场只读当前行链与显式主张。
-// 仅本人 CC 不进争议；同槽位有他人主张才回填本人候选（稳定 ID + 完整 Content）。
+// 仅本人 CC 不进争议。没有本人主张身份时，他人主张只按服务器落盘记录保存，不生成本人候选。
+// 已有本人主张（本地争议或稳定 claimID）时才回填本人候选。
 // 槽位有他人 CC、Disputes 尚无本人时，优先 local.EditBelief / InsertBelief；
 // local 缺行或无有效内容才由服务器链生成。插入提升后可能覆盖本人 Content，故回填后再 Store 一次。
 func rebuildFromChainAndClaims(self string, local *document.Doc, boot protocol.Bootstrap, claimIDs map[string]model.ID) (*document.Doc, error) {
@@ -43,6 +44,15 @@ func rebuildFromChainAndClaims(self string, local *document.Doc, boot protocol.B
 		}
 		slot := claimSlotKey(foreign.RealLine, foreign.Action)
 		ownID := resolveOwnClaimID(claimIDs, ownBySlot, foreign.RealLine, foreign.Action)
+		if ownID.IsZero() {
+			if foreign.Action == model.ActionDelete && len(foreign.Content) != 0 {
+				return nil, fmt.Errorf("删除主张不得带正文")
+			}
+			if err := doc.StoreExplicitClaim(foreign); err != nil {
+				return nil, err
+			}
+			continue
+		}
 
 		if _, ok := ownBySlot[slot]; !ok {
 			if belief, ok := ownBeliefFromLocal(local, self, foreign, ownID); ok {

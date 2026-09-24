@@ -141,8 +141,6 @@ func TestReceiveOrdinaryEditExistingForeignCandidateKeepsDoc(t *testing.T) {
 		{ID: ownID, RealLine: line, Action: model.ActionEdit, Person: "甲", Content: []string{"我的候选"}},
 		{ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"外来候选"}},
 	})
-	before := docSnap(t, d)
-
 	got, err := receiveOrdinaryEdit(d, "甲", "", false, editOp("丙", line.Hex(), []string{"普通包新文"}, strPtr("正式"), nil), model.NewID())
 	if err != nil {
 		t.Fatal(err)
@@ -150,10 +148,10 @@ func TestReceiveOrdinaryEditExistingForeignCandidateKeepsDoc(t *testing.T) {
 	if got != nil {
 		t.Fatalf("不应 CC: %+v", got)
 	}
-	if !slices.Equal(before, docSnap(t, d)) {
-		t.Fatal("已有外来候选时普通包不得改 Doc")
-	}
 	v := mustView(t, d)
+	if v.Lines[0].Content != "普通包新文" {
+		t.Fatalf("停笔后的普通编辑要改正式行: %q", v.Lines[0].Content)
+	}
 	if len(v.Disputes) != 2 {
 		t.Fatalf("不得另开候选: disputes=%d", len(v.Disputes))
 	}

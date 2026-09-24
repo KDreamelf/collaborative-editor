@@ -77,6 +77,7 @@ func (h *Hub) neutralJoin(r *room, client *wsClient, personID, name string) []ou
 	}
 	msgs := []outbound{{client, mustJSON(boot)}}
 	msgs = append(msgs, pendingFollowRelays(client, personID, v.Disputes)...)
+	msgs = append(msgs, pendingDisputeRelays(client, personID, v.Disputes)...)
 	if snap, err := r.buildSnapshot(""); err == nil {
 		msgs = append(msgs, r.broadcastPayload(mustJSON(snap), client)...)
 	}
@@ -110,6 +111,29 @@ func pendingFollowRelays(client *wsClient, personID string, disputes []model.Dis
 	return msgs
 }
 
+// pendingDisputeRelays 重连时把写给 personID 的主张包再送一次。旁观者不收。
+func pendingDisputeRelays(client *wsClient, personID string, disputes []model.Dispute) []outbound {
+	var msgs []outbound
+	for _, d := range disputes {
+		if d.Target != personID || d.Person == personID || d.ID.IsZero() {
+			continue
+		}
+		ev := protocol.RelayEvent{
+			Type: protocol.TypeRelay,
+			Op: protocol.Op{
+				ID:   "dispute-target:" + d.ID.Hex(),
+				Kind: protocol.TypeDisputeCC,
+				DisputeCC: &protocol.DisputeCC{
+					TargetPersonID: personID,
+					Claim:          d,
+				},
+			},
+		}
+		msgs = append(msgs, outbound{client, mustJSON(ev)})
+	}
+	return msgs
+}
+
 func pendingFollowOpID(disputeID, from, to string, clientTs int64) string {
 	return fmt.Sprintf("pending-follow:%s:%s:%s:%d", disputeID, from, to, clientTs)
 }
@@ -117,7 +141,8 @@ func pendingFollowOpID(disputeID, from, to string, clientTs int64) string {
 // neutralBatch 中立批处理：锁内逐 Op 候选 apply；仅成功新 Op 入 seenPayload。
 // 有 Mongo 时先 save 候选 View，成功才替换 r.doc / 记 seen / 计入 Applied 并转发。
 // 域校验失败：ACK.Message 填自然文案。Mongo 保存失败：不 ACK、关发送者 WS，客户端重连原 ID 重发。
-// 同 ID 同载荷幂等；同 ID 异载荷拒。不广播全局争议快照。调用方锁外 sendAll。
+// 同 ID 同载荷幂等；同 ID 异载荷拒。不广播全局快照。
+// 主张、追随、追随答复只送给当事人；旁观者另收已落盘争议记录。调用方锁外 sendAll。
 func (h *Hub) neutralBatch(r *room, client *wsClient, batch protocol.Batch) []outbound {
 	if r == nil {
 		return nil
@@ -133,7 +158,7 @@ func (h *Hub) neutralBatch(r *room, client *wsClient, batch protocol.Batch) []ou
 	applied := 0
 	ackMsg := ""
 	persistFail := false
-	var fresh []protocol.Op
+	var fresh []routedOp
 	for _, op := range batch.Ops {
 		hash := sha256.Sum256(mustJSON(op))
 		if op.ID != "" {
@@ -147,6 +172,8 @@ func (h *Hub) neutralBatch(r *room, client *wsClient, batch protocol.Batch) []ou
 				continue
 			}
 		}
+		party, scoped := partyPersonID(r, op)
+		routed := routedOp{op: op, party: party, partyScoped: scoped}
 		if h.mongo == nil {
 			if err := r.applyNeutralOp(senderID, op); err != nil {
 				log.Printf("neutralBatch apply failed op=%s: %v", op.ID, err)
@@ -186,7 +213,7 @@ func (h *Hub) neutralBatch(r *room, client *wsClient, batch protocol.Batch) []ou
 		}
 		r.seenPayload[op.ID] = hash
 		applied++
-		fresh = append(fresh, op)
+		fresh = append(fresh, routed)
 	}
 	if h.mongo == nil {
 		r.dirty = true
@@ -205,11 +232,94 @@ func (h *Hub) neutralBatch(r *room, client *wsClient, batch protocol.Batch) []ou
 			Message: ackMsg,
 		})})
 	}
-	for _, op := range fresh {
-		ev := protocol.RelayEvent{Type: protocol.TypeRelay, Op: op}
-		msgs = append(msgs, r.broadcastPayload(mustJSON(ev), client)...)
+	sawDispute := false
+	for _, item := range fresh {
+		ev := protocol.RelayEvent{Type: protocol.TypeRelay, Op: item.op}
+		raw := mustJSON(ev)
+		if item.partyScoped {
+			sawDispute = true
+			if item.party != "" && item.party != senderID {
+				if to := r.clientByPerson(item.party); to != nil {
+					msgs = append(msgs, outbound{to, raw})
+				}
+			}
+			continue
+		}
+		msgs = append(msgs, r.broadcastPayload(raw, client)...)
+	}
+	if sawDispute {
+		if view, err := r.doc.View(); err == nil {
+			raw := mustJSON(protocol.DisputeRecord{
+				Type:     protocol.TypeDisputeRecord,
+				Disputes: view.Disputes,
+			})
+			for c := range r.clients {
+				if c == client || c.personID == senderID {
+					continue
+				}
+				msgs = append(msgs, outbound{c, raw})
+			}
+		}
 	}
 	return msgs
+}
+
+// routedOp 记下转发前的当事人。追随可能在 apply 后收口，收件人必须事先记下。
+type routedOp struct {
+	op          protocol.Op
+	party       string
+	partyScoped bool
+}
+
+func partyPersonID(r *room, op protocol.Op) (string, bool) {
+	switch op.Kind {
+	case protocol.TypeDisputeCC:
+		if op.DisputeCC == nil {
+			return "", true
+		}
+		return op.DisputeCC.TargetPersonID, true
+	case protocol.TypeFollow:
+		return followOwner(r, op), true
+	case protocol.TypeFollowAnswer:
+		if op.FollowAnswer == nil {
+			return "", true
+		}
+		return op.FollowAnswer.FromID, true
+	default:
+		return "", false
+	}
+}
+
+func followOwner(r *room, op protocol.Op) string {
+	if r == nil || r.doc == nil || op.Follow == nil {
+		return ""
+	}
+	id, err := model.ParseID(op.Follow.DisputeID)
+	if err != nil {
+		return ""
+	}
+	view, err := r.doc.View()
+	if err != nil {
+		return ""
+	}
+	for _, d := range view.Disputes {
+		if d.ID == id {
+			return d.Person
+		}
+	}
+	return ""
+}
+
+func (r *room) clientByPerson(personID string) *wsClient {
+	if personID == "" {
+		return nil
+	}
+	for c := range r.clients {
+		if c.personID == personID {
+			return c
+		}
+	}
+	return nil
 }
 
 func neutralBaseView(v document.View) document.View {

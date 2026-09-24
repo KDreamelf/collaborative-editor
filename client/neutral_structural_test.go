@@ -101,15 +101,12 @@ func TestIncomingDeleteOnAttentionSendsClaimWithoutLosingLine(t *testing.T) {
 	if err := b.applyRelayOpLocked(a.queue[0]); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.queue) != 1 || b.queue[0].DisputeCC == nil || len(b.queue[0].DisputeCC.Claim.Content) != 0 {
-		t.Fatalf("删行者应抄送自己没有插入的写法: %+v", b.queue)
+	if len(b.queue) != 0 {
+		t.Fatalf("收到主张后不应再回一包: %+v", b.queue)
 	}
-	if err := a.applyRelayOpLocked(b.queue[0]); err != nil {
-		t.Fatal(err)
-	}
-	v = appView(t, a)
-	if len(v.Lines) != 1 || len(v.Disputes) != 2 {
-		t.Fatalf("收到删行者主张后，原行只在候选中出现: %+v", v)
+	v = appView(t, b)
+	if len(v.Disputes) != 1 || v.Disputes[0].Person != "我" {
+		t.Fatalf("只登记对方主张: %+v", v.Disputes)
 	}
 }
 
@@ -143,22 +140,18 @@ func TestForeignClaimReturnsOwnClaimOnce(t *testing.T) {
 	if err := b.applyRelayOpLocked(ccA); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.queue) != 1 || b.queue[0].Kind != protocol.TypeDisputeCC || len(appView(t, b).Disputes) != 2 {
-		t.Fatalf("乙收到甲主张后应抄送自己的写法: queue=%+v disputes=%+v", b.queue, appView(t, b).Disputes)
+	if len(b.queue) != 0 || len(appView(t, b).Disputes) != 1 || appView(t, b).Disputes[0].Person != "甲" {
+		t.Fatalf("乙只登记甲的主张，不回包: queue=%+v disputes=%+v", b.queue, appView(t, b).Disputes)
 	}
 	if err := b.SubmitEditClaim(line.Hex(), []string{"乙改过的主张"}); err != nil {
 		t.Fatal(err)
 	}
 	last := b.queue[len(b.queue)-1]
-	if last.Kind != protocol.TypeDisputeCC || last.DisputeCC == nil ||
-		len(last.DisputeCC.Claim.Content) != 1 || last.DisputeCC.Claim.Content[0] != "乙改过的主张" {
-		t.Fatalf("已入争议后改本人候选只应抄送更新: %+v", b.queue)
+	if last.Kind != protocol.TypeSubmit || last.Submit == nil || last.Submit.Content[0] != "乙改过的主张" {
+		t.Fatalf("再编辑应是普通提交: %+v", b.queue)
 	}
-	if err := a.applyRelayOpLocked(b.queue[0]); err != nil {
-		t.Fatal(err)
-	}
-	if len(a.queue) != 1 || len(appView(t, a).Disputes) != 2 {
-		t.Fatalf("甲收到乙主张后应看到两份，不重复抄送: queue=%+v disputes=%+v", a.queue, appView(t, a).Disputes)
+	if appView(t, b).Lines[0].Content != "乙改过的主张" {
+		t.Fatalf("正式行应更新: %+v", appView(t, b).Lines)
 	}
 }
 
@@ -189,14 +182,17 @@ func TestOwnEditAfterSendingClaimRemainsLatestOnForeignArrival(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := appView(t, a)
+	if v.Lines[0].Content != "甲新" {
+		t.Fatalf("正式行应是甲新: %+v", v.Lines)
+	}
 	for _, claim := range v.Disputes {
 		if claim.Person == "甲" && (len(claim.Content) != 1 || claim.Content[0] != "甲新") {
-			t.Fatalf("本人最新文字不能被旧主张盖掉: %+v", claim)
+			t.Fatalf("留下的本人主张应是最新正文: %+v", claim)
 		}
 	}
 	last := a.queue[len(a.queue)-1]
-	if last.Kind != protocol.TypeDisputeCC || last.DisputeCC.Claim.Content[0] != "甲新" {
-		t.Fatalf("应把最新文字补充抄送: %+v", a.queue)
+	if last.Kind != protocol.TypeSubmit || last.Submit == nil || last.Submit.Content[0] != "甲新" {
+		t.Fatalf("最新文字走普通提交: %+v", a.queue)
 	}
 }
 

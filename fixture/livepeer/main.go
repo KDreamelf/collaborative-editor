@@ -117,7 +117,8 @@ type peer struct {
 	claimID  model.ID
 
 	seen        map[string]bool
-	foreign     map[string]model.Dispute // claimID hex → 他人主张
+	foreign     map[string]model.Dispute // claimID hex → 写给本端的他人主张
+	observed    map[string]model.Dispute // claimID hex → 服务器落盘记录，旁观，不进争议
 	handled     map[string]bool          // 争议决策 key（每场一次）
 	answered    map[string]bool          // followKey → ACK 后才 true
 	answerOpID  map[string]string        // followKey → 稳定 Answer Op.ID
@@ -236,6 +237,13 @@ func (p *peer) onMsg(data []byte, disputeC *<-chan time.Time) error {
 			return nil
 		}
 		return p.onAck(ack)
+	case protocol.TypeDisputeRecord:
+		var rec protocol.DisputeRecord
+		if json.Unmarshal(data, &rec) != nil {
+			return nil
+		}
+		p.onDisputeRecord(rec)
+		return nil
 	case protocol.TypeCursor:
 	case protocol.TypeError:
 		var em protocol.ErrMsg
@@ -370,28 +378,34 @@ func (p *peer) bootstrapOpLanded(op protocol.Op, boot protocol.Bootstrap, byClai
 	}
 }
 
-// importBootstrapDisputes：先扫本人主张定 claimID，再导入他人，最后才 enqueueOwnCC。
-// 单次遍历若 foreign 排在 own 前，会在读到本人旧 ID 前 NewID，与服务器同槽冲突（ErrBroken）。
+// importBootstrapDisputes：落盘记录只旁观。本人主张只稳 claimID。
+// 写给本端的主张包由随后的 Relay 进入争议，这里不 enqueue、不开决策。
 func (p *peer) importBootstrapDisputes(disputes []model.Dispute, disputeC *<-chan time.Time) {
+	_ = disputeC
 	p.foreign = map[string]model.Dispute{}
+	p.observed = map[string]model.Dispute{}
 	for _, d := range disputes {
 		if d.Person == p.personID && !d.ID.IsZero() {
 			p.claimID = d.ID
 		}
 	}
 	for _, d := range disputes {
-		if d.Person == p.personID || d.ID.IsZero() || !p.ownLineEdit(d) {
+		if d.Person == "" || d.Person == p.personID || d.ID.IsZero() {
 			continue
 		}
-		p.foreign[d.ID.Hex()] = cloneDispute(d)
+		p.observed[d.ID.Hex()] = cloneDispute(d)
 	}
-	for _, d := range disputes {
-		if d.Person == p.personID || d.ID.IsZero() || !p.ownLineEdit(d) {
+}
+
+func (p *peer) onDisputeRecord(rec protocol.DisputeRecord) {
+	next := map[string]model.Dispute{}
+	for _, d := range rec.Disputes {
+		if d.Person == "" || d.Person == p.personID || d.ID.IsZero() {
 			continue
 		}
-		p.enqueueOwnCC(d.Person)
+		next[d.ID.Hex()] = cloneDispute(d)
 	}
-	p.syncDisputeTimer(disputeC)
+	p.observed = next
 }
 
 // ownLineEdit：夹具只处理本人 yourLine 上的 ActionEdit 主张。
@@ -479,6 +493,9 @@ func (p *peer) onDisputeCC(op protocol.Op, disputeC *<-chan time.Time) error {
 			content = claim.Content[0]
 		}
 		p.confirmedCC[cc.TargetPersonID] = content
+		return nil
+	}
+	if cc.TargetPersonID != p.personID {
 		return nil
 	}
 	// 追随中：仅本行目标人 CC 更新直接采纳，不新开 10s 决策。

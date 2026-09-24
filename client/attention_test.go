@@ -121,7 +121,7 @@ func TestOwnEditCC(t *testing.T) {
 			active:      true,
 			incoming:    edit(peer, line.Hex(), "对方改"),
 			wantTarget:  peer,
-			wantContent: []string{"我的候选"},
+			wantContent: []string{"正式旧"},
 		},
 		{
 			name:  "多行粘贴相同",
@@ -171,8 +171,8 @@ func TestOwnEditCC(t *testing.T) {
 			wantErr:   true,
 		},
 		{
-			name: "缺少本地行",
-			lines: []model.Line{{ID: other, Content: "别行"}},
+			name:      "缺少本地行",
+			lines:     []model.Line{{ID: other, Content: "别行"}},
 			attention: line.Hex(),
 			active:    true,
 			incoming:  edit(peer, line.Hex(), "对方改"),
@@ -390,7 +390,7 @@ func TestSuspendWithoutForeignOnlyTouchesAttention(t *testing.T) {
 	}
 }
 
-func TestSuspendWithForeignSuspendsOwnClaim(t *testing.T) {
+func TestSuspendWithForeignDoesNotSendSuspend(t *testing.T) {
 	doc := document.New("t")
 	lineID := mustView(t, doc).Lines[0].ID
 	line := lineID.Hex()
@@ -436,27 +436,16 @@ func TestSuspendWithForeignSuspendsOwnClaim(t *testing.T) {
 		app.mu.Unlock()
 		t.Fatal("挂起后注意力应失活")
 	}
-	foundSuspend := false
 	for _, op := range app.queue {
-		if op.Kind == protocol.TypeSuspend && op.Suspend != nil && op.Suspend.Suspended {
-			foundSuspend = true
-			break
+		if op.Kind == protocol.TypeSuspend {
+			app.mu.Unlock()
+			t.Fatalf("停笔不得外发挂起: %+v", op)
 		}
 	}
 	app.mu.Unlock()
-	if !foundSuspend {
-		t.Fatal("有外来时应排 Suspend Op")
-	}
 	after := mustView(t, app.doc)
-	suspended := false
-	for _, id := range after.Suspended {
-		if id == ownID.Hex() {
-			suspended = true
-			break
-		}
-	}
-	if !suspended {
-		t.Fatalf("本人候选应挂起: suspended=%v disputes=%+v", after.Suspended, after.Disputes)
+	if len(after.Suspended) != 0 {
+		t.Fatalf("停笔不得改主张挂起标记: %+v", after.Suspended)
 	}
 }
 
@@ -492,5 +481,26 @@ func TestMoveCaretOnForeignClaimInactive(t *testing.T) {
 	}
 	if app.attentionActive {
 		t.Fatal("外来候选不得激活注意力")
+	}
+}
+
+func TestMoveCaretKeepsOnlyOneLine(t *testing.T) {
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	first := model.NewID().Hex()
+	second := model.NewID().Hex()
+	if err := app.MoveCaret(first, "", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.MoveCaret(second, "", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if app.lineAttendingLocked(first) {
+		t.Fatal("光标挪走后上一行没有注意力")
+	}
+	if !app.lineAttendingLocked(second) || app.attentionLine != second || !app.attentionActive {
+		t.Fatalf("注意力只在当前光标行 line=%s active=%v", app.attentionLine, app.attentionActive)
 	}
 }

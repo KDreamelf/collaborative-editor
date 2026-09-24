@@ -39,7 +39,7 @@ npm run dev
 go run ./fixture/editoracp
 ```
 
-stdin 一行一个 JSON-RPC。`initialize`、`session/new` 之后，`session/prompt` 的文本是一条命令：`join <http> <articleId> <personId>`、`edit <行号> <正文>`、`say <正文>`、`accept <行号> <人>`、`reject <行号> <人>`、`view`。`say` 在文末另起一行。`accept` 是追随对方主张，`reject` 是不接受、保留自己的句子。stdout 只回协议。编辑规则仍以 `需求设计.md` 为准。
+stdin 一行一个 JSON-RPC。`initialize`、`session/new` 之后，`session/prompt` 的文本是一条命令：`join <http> <articleId> <personId>`、`edit <行号> <正文>`、`say <正文>`、`delete <行号>`、`merge <行号>`、`span <起行> <止行> <正文>`、`accept <行号> <人>`、`reject <行号> <人>`、`view`。`say` 在文末另起一行。`delete` 只删空行。`merge` 把这一行接到上一行末尾。`span` 替换连续的正式行，正文里的换行会变成多行。`accept` 是追随对方主张，`reject` 是不接受、保留自己的句子。stdout 只回协议。编辑规则仍以 `需求设计.md` 为准。
 
 ```powershell
 go run -tags fixture ./fixture/livepeer --server http://127.0.0.1:8787

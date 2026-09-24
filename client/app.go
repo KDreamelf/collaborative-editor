@@ -75,9 +75,13 @@ type App struct {
 	// httpTimeout：HTTP/WS 握手时限；0 表示 10s。测试可注入短值。
 	httpTimeout time.Duration
 
-	// attentionLine / attentionActive：本机输入注意力，供后续远端同步判断是否需本人主张 CC。
+	// 一个人只有一个输入光标。attentionLine 是这处，attentionActive 表示还在写。
+	// attending 只留这一行，挪到别处时清掉上一处。
 	attentionLine   string
 	attentionActive bool
+	attending       map[string]bool
+	// localText：接受后本端显示的句子。正式行要等大家都追随才改。
+	localText map[string]string
 
 	// 在线中立转发（Bootstrap / Relay）状态；connect 发 Join 前清 relayReady/preboot。
 	relayReady bool
@@ -741,16 +745,45 @@ func (a *App) MoveCaretRange(lineID, disputeID string, partIndex, offset int, se
 }
 
 func (a *App) setAttentionFromCaretLocked(lineID, disputeID string) {
-	a.attentionLine = lineID
 	if lineID == "" {
+		a.attentionLine = ""
 		a.attentionActive = false
 		return
 	}
-	if disputeID == "" {
+	on := disputeID == "" || a.selfOwnsDisputeLocked(disputeID)
+	a.attentionLine = lineID
+	a.setLineAttendingLocked(lineID, on)
+	a.attentionLine = lineID
+	a.attentionActive = on
+}
+
+func (a *App) lineAttendingLocked(line string) bool {
+	if line == "" {
+		return false
+	}
+	if a.attending != nil {
+		return a.attending[line]
+	}
+	return a.attentionActive && a.attentionLine == line
+}
+
+func (a *App) setLineAttendingLocked(line string, on bool) {
+	if line == "" {
+		return
+	}
+	if on {
+		a.attending = map[string]bool{line: true}
+		a.attentionLine = line
 		a.attentionActive = true
 		return
 	}
-	a.attentionActive = a.selfOwnsDisputeLocked(disputeID)
+	if a.attending != nil {
+		for k := range a.attending {
+			delete(a.attending, k)
+		}
+	}
+	a.attentionLine = line
+	a.attentionActive = false
 }
 
 // disputeRealLineHexLocked 取主张 RealLine；追随 apply 前调用（收口后争议可能已消失）。
@@ -772,7 +805,11 @@ func (a *App) disputeRealLineHexLocked(disputeID model.ID) string {
 
 // deactivateAttentionIfOnLineLocked 追随放下主张：同行仅失活注意力，不清空光标行。
 func (a *App) deactivateAttentionIfOnLineLocked(lineHex string) {
-	if lineHex != "" && a.attentionLine == lineHex {
+	if lineHex == "" {
+		return
+	}
+	a.setLineAttendingLocked(lineHex, false)
+	if a.attentionLine == lineHex {
 		a.attentionActive = false
 	}
 }
@@ -850,30 +887,22 @@ func (a *App) Suspend(lineID, action string, on bool) error {
 	if err != nil {
 		return err
 	}
-	if lineID == a.attentionLine {
-		a.attentionActive = !on
+	if id.IsZero() {
+		return fmt.Errorf("无效行ID")
 	}
-	// 无外来候选时只动注意力，避免单人 live 被 SetSuspended 转成 solo Dispute。
-	if !a.hasForeignDisputeLocked(id, action) {
+	// 停笔只放下这一行的注意力，不向服务器发挂起，也不改主张。
+	// action 仍留给界面传入，服务器不再接收挂起包。
+	_ = action
+	if on {
+		a.setLineAttendingLocked(lineID, false)
+		if a.attentionLine == lineID {
+			a.attentionActive = false
+		}
 		return nil
 	}
-	if err := a.doc.SetSuspended(a.personID, id, action, on); err != nil {
-		return err
-	}
-	if err := a.pushOpLocked(protocol.Op{
-		Kind: protocol.TypeSuspend,
-		Suspend: &protocol.Suspend{
-			Type:      protocol.TypeSuspend,
-			PersonID:  a.personID,
-			LineID:    lineID,
-			Action:    action,
-			Suspended: on,
-		},
-	}); err != nil {
-		return err
-	}
-	a.forceFlushLocked()
-	a.emitSnapshotLocked()
+	a.attentionLine = lineID
+	a.setLineAttendingLocked(lineID, true)
+	a.attentionActive = true
 	return nil
 }
 
@@ -886,6 +915,16 @@ func (a *App) RequestFollow(disputeID string) error {
 	id, err := model.ParseID(disputeID)
 	if err != nil {
 		return err
+	}
+	var lineHex, body string
+	if view, viewErr := a.doc.View(); viewErr == nil {
+		for _, d := range view.Disputes {
+			if d.ID == id && len(d.Content) > 0 {
+				lineHex = d.RealLine.Hex()
+				body = d.Content[0]
+				break
+			}
+		}
 	}
 	ts := time.Now().UnixMilli()
 	out, err := a.doc.RequestFollow(a.personID, id, ts)
@@ -904,8 +943,82 @@ func (a *App) RequestFollow(disputeID string) error {
 		return err
 	}
 	a.forceFlushLocked()
+	if lineHex != "" {
+		if a.localText == nil {
+			a.localText = map[string]string{}
+		}
+		a.localText[lineHex] = body
+		a.deactivateAttentionIfOnLineLocked(lineHex)
+	}
 	a.emitSnapshotLocked()
 	a.emitFollowResultLocked(out.Status, disputeID)
+	return nil
+}
+
+// RejectClaim 不追随这份主张，把本端当前句子再抄送给对方。正式行不动。
+func (a *App) RejectClaim(disputeID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.doc == nil {
+		return fmt.Errorf("尚未加入文档")
+	}
+	id, err := model.ParseID(disputeID)
+	if err != nil {
+		return err
+	}
+	view, err := a.doc.View()
+	if err != nil {
+		return err
+	}
+	var claim *model.Dispute
+	for i := range view.Disputes {
+		if view.Disputes[i].ID == id {
+			claim = &view.Disputes[i]
+			break
+		}
+	}
+	if claim == nil || claim.Person == "" || claim.Person == a.personID {
+		return fmt.Errorf("没有这份他人主张")
+	}
+	lineHex := claim.RealLine.Hex()
+	body := ""
+	if a.localText != nil {
+		body = a.localText[lineHex]
+	}
+	if body == "" {
+		for _, ln := range view.Lines {
+			if ln.ID == claim.RealLine {
+				body = ln.Content
+				break
+			}
+		}
+	}
+	a.attentionLine = lineHex
+	a.setLineAttendingLocked(lineHex, true)
+	a.attentionActive = true
+	if body == "" {
+		a.emitSnapshotLocked()
+		return nil
+	}
+	ownID := a.stableClaimIDLocked(lineHex, model.ActionEdit)
+	if err := a.pushOpLocked(protocol.Op{
+		Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: claim.Person,
+			Claim: model.Dispute{
+				ID:        ownID,
+				RealLine:  claim.RealLine,
+				Action:    model.ActionEdit,
+				Person:    a.personID,
+				Content:   []string{body},
+				Followers: []string{},
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	a.forceFlushLocked()
+	a.emitSnapshotLocked()
 	return nil
 }
 
@@ -971,33 +1084,38 @@ func (a *App) enqueueSubmit(lineID, action string, content []string, wholeClaim 
 		},
 	}
 	if a.relayBooted || a.relayReady {
-		foreign, err := a.foreignClaimForSlotLocked(id, action)
-		if err != nil {
-			return err
-		}
-		if foreign != nil {
-			working := a.doc.Clone()
-			if err := working.SubmitWith(a.personID, id, action, content, opts); err != nil {
-				return a.saveLocalSpanRejectLocked(op)
-			}
-			v, err := working.View()
+		ids := make([]model.ID, len(lineIDs))
+		for i, raw := range lineIDs {
+			parsed, err := model.ParseID(raw)
 			if err != nil {
 				return err
 			}
-			for _, own := range v.Disputes {
-				if own.Person == a.personID && claimSlotKey(own.RealLine, own.Action) == claimSlotKey(id, action) {
-					a.doc = working
-					a.rememberClaimIDLocked(lineID, own.Action, own.ID)
-					if err := a.pushOpLocked(protocol.Op{Kind: protocol.TypeDisputeCC,
-						DisputeCC: &protocol.DisputeCC{TargetPersonID: foreign.Person, Claim: own}}); err != nil {
-						return err
-					}
-					a.emitSnapshotLocked()
-					return nil
-				}
-			}
+			ids[i] = parsed
+		}
+		if err := a.doc.ApplyPlainSubmit(a.personID, id, action, content, ids); err != nil {
 			return a.saveLocalSpanRejectLocked(op)
 		}
+		a.attentionLine = lineID
+		a.setLineAttendingLocked(lineID, true)
+		a.attentionActive = true
+		delete(a.localText, lineID)
+		if sent, ok := a.ownSent[claimSlotKey(id, action)]; ok {
+			sent.Content = append([]string(nil), content...)
+			a.ownSent[claimSlotKey(id, action)] = sent
+			if view, viewErr := a.doc.View(); viewErr == nil {
+				for _, item := range view.Disputes {
+					if item.ID == sent.ID {
+						_ = a.doc.StoreExplicitClaim(sent)
+						break
+					}
+				}
+			}
+		}
+		if err := a.pushOpLocked(op); err != nil {
+			return err
+		}
+		a.emitSnapshotLocked()
+		return nil
 	}
 	if err := a.doc.SubmitWith(a.personID, id, action, content, opts); err != nil {
 		return a.saveLocalSpanRejectLocked(op)

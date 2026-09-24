@@ -12,9 +12,6 @@ import (
 // structuralOwnCCLocked 只在普通结构操作触及本机注意力且结果异文时声明本人的写法。
 // 被物理删除的行以存活邻行作插入锚，避免向服务器申报不存在的 RealLine。
 func (a *App) structuralOwnCCLocked(op protocol.Op) (*protocol.DisputeCC, error) {
-	if !a.attentionActive || a.attentionLine == "" {
-		return nil, nil
-	}
 	v, err := a.doc.View()
 	if err != nil {
 		return nil, err
@@ -35,7 +32,7 @@ func (a *App) structuralOwnCCLocked(op protocol.Op) (*protocol.DisputeCC, error)
 			return nil, fmt.Errorf("缺少删行内容")
 		}
 		target = op.Delete.PersonID
-		if op.Delete.LineID != a.attentionLine {
+		if !a.lineAttendingLocked(op.Delete.LineID) {
 			return nil, nil
 		}
 		i := index(op.Delete.LineID)
@@ -66,7 +63,7 @@ func (a *App) structuralOwnCCLocked(op protocol.Op) (*protocol.DisputeCC, error)
 		if i < 0 {
 			return nil, document.ErrLine
 		}
-		if i == 0 || (a.attentionLine != op.Merge.LineID && a.attentionLine != v.Lines[i-1].ID.Hex()) {
+		if i == 0 || (!a.lineAttendingLocked(op.Merge.LineID) && !a.lineAttendingLocked(v.Lines[i-1].ID.Hex())) {
 			return nil, nil
 		}
 		claim.RealLine, claim.Action = v.Lines[i-1].ID, model.ActionEdit
@@ -77,7 +74,14 @@ func (a *App) structuralOwnCCLocked(op protocol.Op) (*protocol.DisputeCC, error)
 		}
 		s := op.SpanEdit
 		target = s.PersonID
-		if !slices.Contains(s.BaseIDs, a.attentionLine) {
+		hit := false
+		for _, raw := range s.BaseIDs {
+			if a.lineAttendingLocked(raw) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
 			return nil, nil
 		}
 		if len(s.BaseIDs) < 2 {

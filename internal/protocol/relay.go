@@ -6,9 +6,17 @@ import (
 )
 
 // DisputeCC 是客户端主张抄送：目标人 + 现有 model.Dispute，不另造文档类型。
+// 只送给 TargetPersonID。旁观者不收这份包。
 type DisputeCC struct {
 	TargetPersonID string        `json:"targetPersonId"`
 	Claim          model.Dispute `json:"claim"`
+}
+
+// DisputeRecord 是服务器已落盘的争议。旁观者只订这份，不订当事人。
+// 落盘在前。不带收件人，也不替旁观者生成本人主张。
+type DisputeRecord struct {
+	Type     string          `json:"type"`
+	Disputes []model.Dispute `json:"disputes"`
 }
 
 // RelayEvent 是服务器→客户端的转发事件。

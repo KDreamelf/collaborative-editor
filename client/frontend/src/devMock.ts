@@ -43,6 +43,9 @@ function installMockBindings() {
         MergeUp: async (...args: unknown[]) => {
           log.push(['MergeUp', ...args])
         },
+        RejectClaim: async (...args: unknown[]) => {
+          log.push(['RejectClaim', ...args])
+        },
         RequestFollow: async (...args: unknown[]) => {
           log.push(['RequestFollow', ...args])
         },

@@ -8,10 +8,9 @@ import (
 	"github.com/KDreamelf/collaborative-editor/internal/protocol"
 )
 
-// receiveOrdinaryEdit 处理远端普通「改这行」同步包的单步决策。
-// 活跃注意力同行且异文：只返回本人 DisputeCC（主张抄送包），不改 Doc。
-// 已有外来 ActionEdit 候选：保持 Doc，等对方主张包。
-// 其余：用接收前本端正式正文作 BaseContent 整合进 Doc，避免旧基准触发自动争议。
+// receiveOrdinaryEdit 处理远端普通「改这行」。
+// 这一行还在写，且正文不同：只返回本人主张包，不改正式行。
+// 没在写：直接改正式行。已有主张留着。
 func receiveOrdinaryEdit(doc *document.Doc, self, attentionLine string, active bool, op protocol.Op, claimID model.ID) (*protocol.DisputeCC, error) {
 	if op.Kind != protocol.TypeSubmit || op.Submit == nil || op.Submit.Action != model.ActionEdit {
 		return nil, nil
@@ -65,22 +64,11 @@ func receiveOrdinaryEdit(doc *document.Doc, self, attentionLine string, active b
 	if !found {
 		return nil, fmt.Errorf("本地缺少行 %s", sub.LineID)
 	}
-	for _, d := range v.Disputes {
-		if d.RealLine == lineID && d.Action == model.ActionEdit && d.Person != self {
-			return nil, nil
-		}
-	}
 	if len(sub.Content) == 1 && sub.Content[0] == formal {
 		return nil, nil
 	}
-
-	base := formal
-	opts := document.SubmitOpts{
-		BaseContent: &base,
-		LineIDs:     lineIDs,
-		WholeClaim:  sub.WholeClaim,
-	}
-	if err := doc.SubmitWith(sub.PersonID, lineID, model.ActionEdit, append([]string(nil), sub.Content...), opts); err != nil {
+	// 没在写这一行：普通编辑直接改正式行，已有主张留着。
+	if err := doc.ApplyPlainSubmit(sub.PersonID, lineID, model.ActionEdit, append([]string(nil), sub.Content...), lineIDs); err != nil {
 		return nil, err
 	}
 	return nil, nil

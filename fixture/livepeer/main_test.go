@@ -376,7 +376,7 @@ func TestBootstrapOwnDisputeOnlyNoForeign(t *testing.T) {
 	}
 }
 
-func TestBootstrapForeignDisputeStartsDecision(t *testing.T) {
+func TestBootstrapForeignDisputeStaysObserved(t *testing.T) {
 	line := model.NewID()
 	fid := model.NewID()
 	p := freshPeer("script")
@@ -392,13 +392,12 @@ func TestBootstrapForeignDisputeStartsDecision(t *testing.T) {
 	if err := p.applyBootstrap(boot, &disputeC); err != nil {
 		t.Fatal(err)
 	}
-	if len(p.foreign) != 1 || p.foreign[fid.Hex()].Person != "user" {
-		t.Fatalf("他人主张应按 Claim.ID 导入 foreign=%+v", p.foreign)
+	if len(p.foreign) != 0 || len(p.outQ) != 0 || p.disputeTimer != nil {
+		t.Fatalf("落盘记录不得进争议 foreign=%d q=%v timer=%v", len(p.foreign), kinds(p.outQ), p.disputeTimer != nil)
 	}
-	if p.disputeTimer == nil || disputeC == nil {
-		t.Fatal("他人 Disputes 应启动 10s 决策")
+	if p.observed[fid.Hex()].Person != "user" {
+		t.Fatalf("应旁观服务器记录: %+v", p.observed)
 	}
-	p.stopDisputeTimer()
 }
 
 // 别行主张不得进 foreign / 挡写 / 开 Follow；本行继续普通 Edit。
@@ -556,8 +555,21 @@ func TestBootstrapForeignBeforeOwnReusesOwnClaimID(t *testing.T) {
 	if p.claimID != ownID {
 		t.Fatalf("claimID=%s want own %s", p.claimID.Hex(), ownID.Hex())
 	}
-	if _, self := p.foreign[ownID.Hex()]; self || len(p.foreign) != 1 || p.foreign[fid.Hex()].Person != "user" {
-		t.Fatalf("不自争议且仅导入他人: foreign=%+v", p.foreign)
+	if len(p.foreign) != 0 || len(p.outQ) != 0 {
+		t.Fatalf("入场记录不得发包 foreign=%+v q=%v", p.foreign, kinds(p.outQ))
+	}
+	cc := protocol.Op{
+		ID: model.NewID().Hex(), Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: "script",
+			Claim: model.Dispute{
+				ID: fid, RealLine: line, Action: model.ActionEdit,
+				Person: "user", Content: []string{"用户文"},
+			},
+		},
+	}
+	if err := p.onDisputeCC(cc, &disputeC); err != nil {
+		t.Fatal(err)
 	}
 	var ccs []protocol.Op
 	for _, op := range p.outQ {
@@ -572,7 +584,7 @@ func TestBootstrapForeignBeforeOwnReusesOwnClaimID(t *testing.T) {
 		t.Fatalf("CC 须用 own.ID 指向 foreign: %+v", ccs[0].DisputeCC)
 	}
 	if p.disputeTimer == nil || disputeC == nil {
-		t.Fatal("他人主张仍须 10s 决策")
+		t.Fatal("写给自己的主张包仍须 10s 决策")
 	}
 	p.stopDisputeTimer()
 }
@@ -638,6 +650,7 @@ func newTestPeer(person, line, own string) *peer {
 		formal:      map[string]string{line: own},
 		seen:        map[string]bool{},
 		foreign:     map[string]model.Dispute{},
+		observed:    map[string]model.Dispute{},
 		handled:     map[string]bool{},
 		answered:    map[string]bool{},
 		answerOpID:  map[string]string{},
@@ -654,6 +667,7 @@ func freshPeer(person string) *peer {
 		formal:      map[string]string{},
 		seen:        map[string]bool{},
 		foreign:     map[string]model.Dispute{},
+		observed:    map[string]model.Dispute{},
 		handled:     map[string]bool{},
 		answered:    map[string]bool{},
 		answerOpID:  map[string]string{},

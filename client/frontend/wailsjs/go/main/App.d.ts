@@ -32,6 +32,8 @@ export function PersonID():Promise<string>;
 
 export function ReportError(arg1:string,arg2:string):Promise<void>;
 
+export function RejectClaim(arg1:string):Promise<void>;
+
 export function RequestFollow(arg1:string):Promise<void>;
 
 export function SetServer(arg1:string):Promise<void>;

@@ -62,7 +62,11 @@ func (r *room) applyNeutralOp(senderPersonID string, op protocol.Op) error {
 		return r.doc.ApplyPlainSuspend(op.Suspend.PersonID, lineID, op.Suspend.Action, op.Suspend.Suspended)
 
 	case protocol.TypeDisputeCC:
-		return r.doc.StoreExplicitClaim(op.DisputeCC.Claim)
+		claim := op.DisputeCC.Claim
+		if claim.Target == "" {
+			claim.Target = op.DisputeCC.TargetPersonID
+		}
+		return r.doc.StoreExplicitClaim(claim)
 
 	case protocol.TypeFollow:
 		disputeID, err := model.ParseID(op.Follow.DisputeID)

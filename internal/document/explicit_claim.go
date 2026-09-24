@@ -52,15 +52,78 @@ func (d *Doc) StoreExplicitClaim(claim model.Dispute) error {
 			RealLine:  claim.RealLine,
 			Action:    claim.Action,
 			Person:    claim.Person,
+			Target:    claim.Target,
 			Followers: d.seedFollowMeta(claim.ID, claim.Followers, claim.Pending),
 		}
 		d.disputes[claim.ID] = item
 	}
 	item.Action = claim.Action
+	if claim.Target != "" {
+		item.Target = claim.Target
+	}
 	item.Content = content
 	item.BaseIDs = baseIDs
 	item.Pending = nil // 与 Load 一致：待确认落在 d.pending
 	return nil
+}
+
+// ReplaceForeignClaims 用服务器已落盘的他人主张替换本机上的他人主张。
+// 不新增本人主张，不改正式行。Person 为空或等于 self 的条目忽略。
+func (d *Doc) ReplaceForeignClaims(self string, claims []model.Dispute) error {
+	keep := map[model.ID]struct{}{}
+	for _, claim := range claims {
+		if claim.Person == "" || claim.Person == self {
+			continue
+		}
+		if claim.ID.IsZero() || claim.RealLine.IsZero() || d.lines[claim.RealLine] == nil {
+			return ErrBroken
+		}
+		keep[claim.ID] = struct{}{}
+	}
+	for id, item := range d.disputes {
+		if item.Person == self {
+			continue
+		}
+		if _, ok := keep[id]; ok {
+			continue
+		}
+		delete(d.disputes, id)
+		delete(d.suspended, id)
+	}
+	d.sweepPending()
+	for _, claim := range claims {
+		if claim.Person == "" || claim.Person == self {
+			continue
+		}
+		if _, exists := d.disputes[claim.ID]; exists {
+			delete(d.disputes, claim.ID)
+			delete(d.suspended, claim.ID)
+		}
+		d.pending = slicesDeletePending(d.pending, claim.ID)
+		item := claim
+		if item.Followers == nil {
+			item.Followers = []string{}
+		}
+		for _, p := range claim.Pending {
+			d.pending = append(d.pending, followPend{
+				from: p.From, to: p.To, dispute: claim.ID, ts: p.ClientTs,
+			})
+		}
+		item.Pending = nil
+		cp := item
+		d.disputes[claim.ID] = &cp
+	}
+	return nil
+}
+
+func slicesDeletePending(in []followPend, dispute model.ID) []followPend {
+	out := in[:0]
+	for _, p := range in {
+		if p.dispute != dispute {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // seedFollowMeta 首次见到 Claim.ID：复制 Followers，Pending 写入 d.pending。

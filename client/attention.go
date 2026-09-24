@@ -29,9 +29,28 @@ func ownEditCC(doc *document.Doc, self, attentionLine string, active bool, incom
 		return nil, fmt.Errorf("无效行ID %q", sub.LineID)
 	}
 
-	own, err := doc.EditBelief(self, lineID)
+	// 单行以正式正文为准：后来的普通编辑盖过旧主张。多行粘贴仍用整段信念。
+	belief, err := doc.EditBelief(self, lineID)
 	if err != nil {
 		return nil, fmt.Errorf("本地缺少行 %s", sub.LineID)
+	}
+	own := belief
+	if len(belief) == 1 {
+		view, err := doc.View()
+		if err != nil {
+			return nil, err
+		}
+		foundLine := false
+		for _, ln := range view.Lines {
+			if ln.ID == lineID {
+				own = []string{ln.Content}
+				foundLine = true
+				break
+			}
+		}
+		if !foundLine {
+			return nil, fmt.Errorf("本地缺少行 %s", sub.LineID)
+		}
 	}
 	if slices.Equal(sub.Content, own) {
 		return nil, nil

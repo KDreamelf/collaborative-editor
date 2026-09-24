@@ -253,6 +253,99 @@ func TestNeutralBatchDomainRejectHasMessage(t *testing.T) {
 	}
 }
 
+func TestNeutralBatchDisputeOnlyToTargetRecordToObserver(t *testing.T) {
+	h := NewHub(nil)
+	meta := h.CreateArticle("t")
+	r := h.getRoom(meta.ID)
+	a, b, c := &wsClient{}, &wsClient{}, &wsClient{}
+	h.neutralJoin(r, a, "A", "甲")
+	h.neutralJoin(r, b, "B", "乙")
+	h.neutralJoin(r, c, "C", "丙")
+	line := mustView(t, r).Lines[0].ID
+	claimID := model.NewID()
+	cc := protocol.Op{
+		ID: "cc", Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: "B",
+			Claim: model.Dispute{
+				ID: claimID, RealLine: line, Action: model.ActionEdit, Person: "A",
+				Content: []string{"甲主张"}, Followers: []string{},
+			},
+		},
+	}
+	msgs := h.neutralBatch(r, a, protocol.Batch{Seq: 1, Ops: []protocol.Op{cc}})
+	if len(outboundsOfType(t, msgs, a, protocol.TypeRelay)) != 0 || len(outboundsOfType(t, msgs, a, protocol.TypeDisputeRecord)) != 0 {
+		t.Fatal("发送者不得收回主张包或落盘记录")
+	}
+	if len(outboundsOfType(t, msgs, b, protocol.TypeRelay)) != 1 {
+		t.Fatal("主张包只送给收件人")
+	}
+	if len(outboundsOfType(t, msgs, c, protocol.TypeRelay)) != 0 {
+		t.Fatal("旁观者不得收到主张包")
+	}
+	recs := outboundsOfType(t, msgs, c, protocol.TypeDisputeRecord)
+	if len(recs) != 1 {
+		t.Fatalf("旁观者应收到落盘记录: %d", len(recs))
+	}
+	var rec protocol.DisputeRecord
+	if err := json.Unmarshal(recs[0], &rec); err != nil || len(rec.Disputes) != 1 || rec.Disputes[0].ID != claimID || rec.Disputes[0].Person != "A" {
+		t.Fatalf("记录: %s err=%v", recs[0], err)
+	}
+}
+
+func TestNeutralJoinReplaysDisputeToTargetOnly(t *testing.T) {
+	h := NewHub(nil)
+	meta := h.CreateArticle("t")
+	r := h.getRoom(meta.ID)
+	a := &wsClient{}
+	h.neutralJoin(r, a, "A", "甲")
+	line := mustView(t, r).Lines[0].ID
+	claimID := model.NewID()
+	cc := protocol.Op{
+		ID: "cc", Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: "B",
+			Claim: model.Dispute{
+				ID: claimID, RealLine: line, Action: model.ActionEdit, Person: "A",
+				Content: []string{"甲主张"}, Followers: []string{},
+			},
+		},
+	}
+	if ack := mustOutboundAck(t, h.neutralBatch(r, a, protocol.Batch{Seq: 1, Ops: []protocol.Op{cc}}), a); ack.Applied != 1 {
+		t.Fatalf("ACK: %+v", ack)
+	}
+	stored := mustView(t, r).Disputes
+	if len(stored) != 1 || stored[0].Target != "B" {
+		t.Fatalf("落盘应记下收件人: %+v", stored)
+	}
+
+	b := &wsClient{}
+	join := h.neutralJoin(r, b, "B", "乙")
+	found := false
+	for _, raw := range outboundsOfType(t, join, b, protocol.TypeRelay) {
+		var ev protocol.RelayEvent
+		if json.Unmarshal(raw, &ev) != nil || ev.Op.Kind != protocol.TypeDisputeCC || ev.Op.DisputeCC == nil {
+			continue
+		}
+		found = true
+		if ev.Op.DisputeCC.TargetPersonID != "B" || ev.Op.DisputeCC.Claim.ID != claimID {
+			t.Fatalf("重连主张包: %+v", ev.Op.DisputeCC)
+		}
+	}
+	if !found {
+		t.Fatal("收件人重连应再收到写给自己的主张包")
+	}
+
+	c := &wsClient{}
+	cJoin := h.neutralJoin(r, c, "C", "丙")
+	for _, raw := range outboundsOfType(t, cJoin, c, protocol.TypeRelay) {
+		var ev protocol.RelayEvent
+		if json.Unmarshal(raw, &ev) == nil && ev.Op.Kind == protocol.TypeDisputeCC {
+			t.Fatal("旁观者入场不得收到主张包")
+		}
+	}
+}
+
 func TestNeutralBatchCCThenDisputeNoErrorText(t *testing.T) {
 	h := NewHub(nil)
 	meta := h.CreateArticle("t")

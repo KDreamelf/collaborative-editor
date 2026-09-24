@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/KDreamelf/collaborative-editor/internal/document"
@@ -122,6 +121,7 @@ func (a *App) onBootstrap(boot protocol.Bootstrap, gen uint64) {
 	a.cursors = append([]protocol.Cursor(nil), boot.Cursors...)
 	// 重连必须失活；首次加入同置 false。
 	a.attentionActive = false
+	a.attending = nil
 
 	// serverSnap 只缓存最近共享链，不再当本端唯一正文权威。
 	a.rememberServerSnapLocked(protocol.Snapshot{
@@ -411,6 +411,8 @@ func (a *App) applyRelayFollowAnswerLocked(op protocol.Op) error {
 		return err
 	}
 	lineHex := a.disputeRealLineHexLocked(id)
+	slotLine, slotAction, slotOK := a.disputeSlotLocked(id)
+	wasIdle := !a.attentionActive
 	out, err := a.doc.AnswerFollow(ans.PersonID, ans.FromID, id, ans.Accept)
 	if err != nil {
 		if errors.Is(err, document.ErrNoDispute) {
@@ -420,7 +422,11 @@ func (a *App) applyRelayFollowAnswerLocked(op protocol.Op) error {
 		return err
 	}
 	// 本端追随确认 applied：放下目标主张 RealLine 上的注意力，避免下一笔普通 Edit 再发 CC。
+	// 停笔后的同文收束也在这里丢掉旧 ownSent，避免下次再把旧主张外发。
 	if ans.Accept && out.Status == document.FollowApplied {
+		if wasIdle && slotOK {
+			delete(a.ownSent, claimSlotKey(slotLine, slotAction))
+		}
 		a.deactivateAttentionIfOnLineLocked(lineHex)
 	}
 	a.markRelaySeenLocked(op.ID)
@@ -444,7 +450,8 @@ func (a *App) applyRelayEditLocked(op protocol.Op) error {
 	}
 
 	claimID := a.stableClaimIDLocked(sub.LineID, model.ActionEdit)
-	cc, err := receiveOrdinaryEdit(a.doc, a.personID, a.attentionLine, a.attentionActive, op, claimID)
+	before := a.lineContentLocked(sub.LineID)
+	cc, err := receiveOrdinaryEdit(a.doc, a.personID, sub.LineID, a.lineAttendingLocked(sub.LineID), op, claimID)
 	if err != nil {
 		return err
 	}
@@ -458,12 +465,31 @@ func (a *App) applyRelayEditLocked(op protocol.Op) error {
 			return err
 		}
 		a.forceFlushLocked()
-		// pushOp 已原子落盘 queue+seen+本端 View；本地 Doc 不进争议。
+		// 还在写这一行：不收对方正文。
 		return nil
+	}
+	if a.lineContentLocked(sub.LineID) != before {
+		delete(a.localText, sub.LineID)
 	}
 	a.persistAfterMutationLocked()
 	a.emitSnapshotLocked()
 	return nil
+}
+
+func (a *App) lineContentLocked(lineHex string) string {
+	if a.doc == nil {
+		return ""
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return ""
+	}
+	for _, ln := range v.Lines {
+		if ln.ID.Hex() == lineHex {
+			return ln.Content
+		}
+	}
+	return ""
 }
 
 func (a *App) applyRelayInsertLocked(op protocol.Op) error {
@@ -502,6 +528,36 @@ func (a *App) applyRelayInsertLocked(op protocol.Op) error {
 	return nil
 }
 
+// disputeSlotLocked 在 Answer 删掉争议前记下槽位，供确认后清 ownSent。
+func (a *App) disputeSlotLocked(id model.ID) (model.ID, string, bool) {
+	if a.doc == nil || id.IsZero() {
+		return model.ID{}, "", false
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return model.ID{}, "", false
+	}
+	for _, d := range v.Disputes {
+		if d.ID == id {
+			return d.RealLine, d.Action, true
+		}
+	}
+	return model.ID{}, "", false
+}
+
+func (a *App) onDisputeRecord(rec protocol.DisputeRecord, gen uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.connGen != gen || a.doc == nil {
+		return
+	}
+	if err := a.doc.ReplaceForeignClaims(a.personID, rec.Disputes); err != nil {
+		return
+	}
+	a.persistAfterMutationLocked()
+	a.emitSnapshotLocked()
+}
+
 func (a *App) applyRelayDisputeCCLocked(op protocol.Op) error {
 	cc := op.DisputeCC
 	claim := cc.Claim
@@ -511,118 +567,24 @@ func (a *App) applyRelayDisputeCCLocked(op protocol.Op) error {
 		a.persistAfterMutationLocked()
 		return nil
 	}
-	slot := claimSlotKey(claim.RealLine, claim.Action)
-	ownID := a.stableClaimIDLocked(claim.RealLine.Hex(), claim.Action)
-	working := a.doc.Clone()
-	if own, ok := a.ownSent[slot]; ok {
-		current, err := working.View()
-		if err != nil {
-			return err
-		}
-		hasLocal := false
-		for _, item := range current.Disputes {
-			if item.Person == a.personID && claimSlotKey(item.RealLine, item.Action) == slot {
-				hasLocal = true
-				break
-			}
-		}
-		if !hasLocal {
-			// 本人发过主张后仍可继续输入；收外来主张时以当前本机文字更新候选。
-			switch {
-			case own.Action == model.ActionEdit || own.Action == model.ActionDelete:
-				if belief, err := a.doc.EditBelief(a.personID, own.RealLine); err == nil &&
-					(own.Action != model.ActionDelete || len(belief) != 1 || belief[0] != "") {
-					own.Action, own.Content = model.ActionEdit, belief
-				}
-			case model.IsInsertAction(own.Action):
-				if len(own.BaseIDs) == 1 {
-					for _, ln := range current.Lines {
-						if ln.ID == own.BaseIDs[0] {
-							own.Content = []string{ln.Content}
-							break
-						}
-					}
-				} else if belief, err := a.doc.InsertBelief(a.personID, own.RealLine, own.Action); err == nil {
-					own.Content = belief
-				}
-			}
-			if err := working.StoreExplicitClaim(own); err != nil {
-				return err
-			}
-		}
+	if cc.TargetPersonID != a.personID {
+		// 没写给本端。旁观争议只走已落盘记录。
+		a.markRelaySeenLocked(op.ID)
+		a.persistAfterMutationLocked()
+		return nil
 	}
-	switch {
-	case claim.Action == model.ActionEdit:
-		if err := working.ReceiveForeignEditClaim(a.personID, claim, ownID); err != nil {
-			return err
-		}
-	case model.IsInsertAction(claim.Action):
-		if err := working.ReceiveForeignInsertClaim(a.personID, claim, ownID); err != nil {
-			return err
-		}
-	case claim.Action == model.ActionDelete:
-		if err := working.ReceiveForeignDeleteClaim(a.personID, claim, ownID); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("在线转发暂未处理: DisputeCC %s", claim.Action)
-	}
-	// 我保留的行已被对方普通删行：收到其“未插入”主张后，正文链跟上删除，
-	// 本人文字只留在刚才抄送的插入候选里。BaseIDs 记录原行 ID。
-	if sent, ok := a.ownSent[slot]; ok && model.IsInsertAction(sent.Action) && len(sent.BaseIDs) == 1 {
-		deleted := sent.BaseIDs[0]
-		current, err := working.View()
-		if err != nil {
-			return err
-		}
-		for _, ln := range current.Lines {
-			if ln.ID != deleted {
-				continue
-			}
-			if err := working.ApplyPlainSubmit(a.personID, deleted, model.ActionEdit, []string{""}, nil); err != nil {
-				return err
-			}
-			if err := working.ApplyPlainDelete(deleted); err != nil {
-				return err
-			}
-			break
-		}
-	}
-	v, err := working.View()
-	if err != nil {
+	if err := a.doc.StoreExplicitClaim(claim); err != nil {
 		return err
 	}
-	var own *model.Dispute
-	for i := range v.Disputes {
-		d := &v.Disputes[i]
-		if d.Person == a.personID && claimSlotKey(d.RealLine, d.Action) == slot {
-			own = d
-			break
-		}
-	}
-	if own == nil && model.IsInsertAction(claim.Action) {
-		zero := model.Dispute{ID: ownID, RealLine: claim.RealLine, Action: claim.Action,
-			Person: a.personID, Content: []string{}, Followers: []string{}}
-		if err := working.StoreExplicitClaim(zero); err != nil {
+	// 本端已经抄送过的主张一并留下，追随才能在双方主张上都成立。不再回一包新的主张。
+	slot := claimSlotKey(claim.RealLine, claim.Action)
+	if sent, ok := a.ownSent[slot]; ok {
+		if err := a.doc.StoreExplicitClaim(sent); err != nil {
 			return err
 		}
-		own = &zero
 	}
-	if own == nil {
-		return document.ErrBroken
-	}
-	a.doc = working
 	a.markRelaySeenLocked(op.ID)
-	if sent, ok := a.ownSent[slot]; !ok || sent.ID != own.ID || sent.Action != own.Action ||
-		!slices.Equal(sent.Content, own.Content) || !slices.Equal(sent.BaseIDs, own.BaseIDs) {
-		if err := a.pushOpLocked(protocol.Op{Kind: protocol.TypeDisputeCC,
-			DisputeCC: &protocol.DisputeCC{TargetPersonID: claim.Person, Claim: *own}}); err != nil {
-			return err
-		}
-		a.forceFlushLocked()
-	} else {
-		a.persistAfterMutationLocked()
-	}
+	a.persistAfterMutationLocked()
 	a.emitSnapshotLocked()
 	return nil
 }

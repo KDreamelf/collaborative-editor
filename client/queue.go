@@ -306,6 +306,12 @@ func (a *App) handleMessage(data []byte, gen uint64) {
 			return
 		}
 		a.onRelay(ev, gen)
+	case protocol.TypeDisputeRecord:
+		var rec protocol.DisputeRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return
+		}
+		a.onDisputeRecord(rec, gen)
 	case protocol.TypeCursor:
 		var msg protocol.CursorMsg
 		if err := json.Unmarshal(data, &msg); err != nil {
@@ -559,8 +565,7 @@ func (a *App) replayQueueLocked() {
 }
 
 // replayUnackedPlainLocked Bootstrap 后重放未 ACK 普通 Op 到新链。
-// 有 foreign 候选：纯函数已留本人内容，不再 ApplyPlain 以免重复写正式链。
-// 无 foreign：ApplyPlain*（预生行 ID 已在则幂等）。CC/Follow/Answer 只留 queue 重发，不凭空开 UI 争议。
+// 普通编辑即使已有主张也改正式行。删改合并在已有外来主张时不重放，避免再开一份本地争议。
 func (a *App) replayUnackedPlainLocked() {
 	if a.doc == nil || len(a.queue) == 0 {
 		return
@@ -571,7 +576,7 @@ func (a *App) replayUnackedPlainLocked() {
 		case protocol.TypeDisputeCC, protocol.TypeFollow, protocol.TypeFollowAnswer:
 			continue
 		case protocol.TypeSubmit, protocol.TypeDelete, protocol.TypeMerge, protocol.TypeSpanEdit:
-			if a.queueOpHasForeignLocked(op) {
+			if op.Kind != protocol.TypeSubmit && a.queueOpHasForeignLocked(op) {
 				continue
 			}
 			if err := a.applyPlainOpLocked(op); err != nil {
@@ -823,6 +828,24 @@ func (a *App) emitSnapshotLocked() {
 	if err != nil {
 		runtime.EventsEmit(a.ctx, "error", err.Error())
 		return
+	}
+	if len(a.localText) > 0 {
+		lines := append([]model.Line(nil), view.Lines...)
+		for i := range lines {
+			if text, ok := a.localText[lines[i].ID.Hex()]; ok {
+				lines[i].Content = text
+			}
+		}
+		view.Lines = lines
+		disputes := append([]model.Dispute(nil), view.Disputes...)
+		for i := range disputes {
+			text, ok := a.localText[disputes[i].RealLine.Hex()]
+			if !ok || disputes[i].Person != a.personID || disputes[i].Action != model.ActionEdit {
+				continue
+			}
+			disputes[i].Content = []string{text}
+		}
+		view.Disputes = disputes
 	}
 	snap := protocol.Snapshot{
 		Type:     protocol.TypeSnapshot,

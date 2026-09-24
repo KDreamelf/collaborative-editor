@@ -62,6 +62,10 @@ export function ReportError(arg1, arg2) {
   return window['go']['main']['App']['ReportError'](arg1, arg2);
 }
 
+export function RejectClaim(arg1) {
+  return window['go']['main']['App']['RejectClaim'](arg1);
+}
+
 export function RequestFollow(arg1) {
   return window['go']['main']['App']['RequestFollow'](arg1);
 }

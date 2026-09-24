@@ -949,8 +949,8 @@ func TestRelayFollowAutoAcceptUnidirectionalOwnClaim(t *testing.T) {
 	}
 
 	appB.onRelay(protocol.RelayEvent{Type: protocol.TypeRelay, Op: *ccA}, appB.connGen)
-	if countEditDisputes(appView(t, appB), line) != 2 {
-		t.Fatalf("B 收 A CC 后应两候选: %+v", appView(t, appB).Disputes)
+	if countEditDisputes(appView(t, appB), line) != 1 {
+		t.Fatalf("B 只登记甲的主张: %+v", appView(t, appB).Disputes)
 	}
 	if err := appB.RequestFollow(claimID.Hex()); err != nil {
 		t.Fatal(err)
@@ -1694,7 +1694,6 @@ func TestRelayInsertActiveAttentionQueuesOwnCC(t *testing.T) {
 	appB.relayBooted = true
 	appB.serverSnap = &protocol.Snapshot{Type: protocol.TypeSnapshot, View: base}
 
-	before := appView(t, appB)
 	insA := protocol.Op{
 		ID:   model.NewID().Hex(),
 		Kind: protocol.TypeSubmit,
@@ -1710,35 +1709,19 @@ func TestRelayInsertActiveAttentionQueuesOwnCC(t *testing.T) {
 	appB.onRelay(protocol.RelayEvent{Type: protocol.TypeRelay, Op: insA}, appB.connGen)
 
 	vB := appView(t, appB)
-	if len(vB.Lines) != 1 || vB.Lines[0].ID != anchor || vB.Lines[0].Content != "锚" {
-		t.Fatalf("正式链应不变: %+v", vB.Lines)
+	if len(vB.Lines) != 2 || vB.Lines[0].ID != anchor || vB.Lines[1].Content != "对方插" {
+		t.Fatalf("插入应直接进正式链: %+v", vB.Lines)
 	}
 	if countInsertDisputes(vB, anchor, model.ActionInsert) != 0 {
 		t.Fatalf("本地不得进插入争议: %+v", vB.Disputes)
 	}
-	appB.mu.Lock()
-	var ccOp *protocol.Op
-	for i := range appB.queue {
-		if appB.queue[i].Kind == protocol.TypeDisputeCC {
-			op := appB.queue[i]
-			ccOp = &op
-			break
-		}
-	}
-	claimID := appB.stableClaimIDLocked(anchor.Hex(), model.ActionInsert)
-	appB.mu.Unlock()
-	if ccOp == nil || ccOp.DisputeCC == nil {
-		t.Fatal("应入队本人 Insert DisputeCC")
-	}
-	if ccOp.DisputeCC.Claim.Person != "乙" || ccOp.DisputeCC.Claim.ID != claimID ||
-		ccOp.DisputeCC.Claim.Action != model.ActionInsert || ccOp.DisputeCC.Claim.RealLine != anchor {
-		t.Fatalf("cc=%+v want claimID=%s", ccOp.DisputeCC, claimID.Hex())
+	if queueKindCount(appB, protocol.TypeDisputeCC) != 0 {
+		t.Fatal("插入不发主张")
 	}
 
-	// 重复普通包幂等：仍只一条 CC。
 	appB.onRelay(protocol.RelayEvent{Type: protocol.TypeRelay, Op: insA}, appB.connGen)
-	if queueKindCount(appB, protocol.TypeDisputeCC) != 1 {
-		t.Fatalf("重复 Insert CC 数=%d", queueKindCount(appB, protocol.TypeDisputeCC))
+	if v := appView(t, appB); len(v.Lines) != 2 {
+		t.Fatalf("重复插入应幂等: %+v", v.Lines)
 	}
 
 	// foreign Insert CC 入场；同 ID 重收不增候选；正式链不变。
@@ -1759,14 +1742,14 @@ func TestRelayInsertActiveAttentionQueuesOwnCC(t *testing.T) {
 	}
 	appB.onRelay(protocol.RelayEvent{Type: protocol.TypeRelay, Op: foreignCC}, appB.connGen)
 	vB2 := appView(t, appB)
-	if len(vB2.Lines) != len(before.Lines) || vB2.Lines[0].ID != anchor {
+	if len(vB2.Lines) != 2 || vB2.Lines[0].ID != anchor {
 		t.Fatalf("foreign Insert CC 不得改链: %+v", vB2.Lines)
 	}
-	if countInsertDisputes(vB2, anchor, model.ActionInsert) != 2 {
-		t.Fatalf("外来插入 CC 应连同本人未插入的写法入场: %+v", vB2.Disputes)
+	if countInsertDisputes(vB2, anchor, model.ActionInsert) != 1 {
+		t.Fatalf("只登记对方插入主张: %+v", vB2.Disputes)
 	}
 	appB.onRelay(protocol.RelayEvent{Type: protocol.TypeRelay, Op: foreignCC}, appB.connGen)
-	if countInsertDisputes(appView(t, appB), anchor, model.ActionInsert) != 2 {
+	if countInsertDisputes(appView(t, appB), anchor, model.ActionInsert) != 1 {
 		t.Fatalf("同 ID 重收不得增候选: %+v", appView(t, appB).Disputes)
 	}
 }
@@ -1855,8 +1838,11 @@ func TestOnBootstrapUnackedEditKeepsCandidateAndQueue(t *testing.T) {
 	if len(app.queue) != 1 || app.queue[0].ID != "op-unacked" {
 		t.Fatalf("须保留未 ACK queue: %+v", app.queue)
 	}
-	if len(app.rejected) != 1 || app.rejected[0].ID != "rej1" {
-		t.Fatalf("须保留 rejected: %+v", app.rejected)
+	if len(app.rejected) != 0 {
+		t.Fatalf("已重放进正式行的提交不再算拒绝: %+v", app.rejected)
+	}
+	if v.Lines[0].Content != "我未ACK" {
+		t.Fatalf("未 ACK 编辑应写上正式行: %q", v.Lines[0].Content)
 	}
 	if app.attentionActive {
 		t.Fatal("attentionActive 须失活")
@@ -2320,8 +2306,17 @@ func TestFormalWSReconnectKeepsUnackedWithForeign(t *testing.T) {
 		}
 	}
 	idA := appA2.PersonID()
-	if got[idA] != "甲未ACK" {
-		t.Fatalf("应保住未 ACK 本人候选: %v", got)
+	var formal string
+	for _, ln := range v.Lines {
+		if ln.ID == lid {
+			formal = ln.Content
+		}
+	}
+	if formal != "甲未ACK" {
+		t.Fatalf("应保住未 ACK 正式行: line=%q disputes=%v", formal, got)
+	}
+	if got[idA] == "" && got["乙方正文"] == "" && len(got) == 0 {
+		t.Fatalf("重连后主张丢了: %v", got)
 	}
 	if gotID[idA] != ownBefore && !ownBefore.IsZero() {
 		t.Fatalf("claimID 漂移 before=%v after=%v", ownBefore, gotID[idA])
@@ -2402,8 +2397,8 @@ func TestRelayDisputeCCDeleteAndBodySlotID(t *testing.T) {
 	if len(v.Lines) != 1 || v.Lines[0].ID != line || v.Lines[0].Content != "正文" {
 		t.Fatalf("外来 Delete 须保留行: %+v", v.Lines)
 	}
-	if countBodyDisputes(v, line) != 2 {
-		t.Fatalf("外来 Delete 应登记双方 body 候选: %+v", v.Disputes)
+	if countBodyDisputes(v, line) != 1 {
+		t.Fatalf("只登记对方删行主张: %+v", v.Disputes)
 	}
 	got := map[string]string{}
 	for _, d := range v.Disputes {
@@ -2411,8 +2406,8 @@ func TestRelayDisputeCCDeleteAndBodySlotID(t *testing.T) {
 			got[d.Person] = d.Action
 		}
 	}
-	if got["甲"] != model.ActionEdit || got["乙"] != model.ActionDelete {
-		t.Fatalf("本人保留行 Edit、对方 Delete: %v", got)
+	if got["乙"] != model.ActionDelete || got["甲"] != "" {
+		t.Fatalf("不替本人造保留行主张: %v", got)
 	}
 
 	ownDelID := model.NewID()

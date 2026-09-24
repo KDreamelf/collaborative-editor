@@ -18,13 +18,13 @@ type Article struct {
 // Line 是正式行。前后指针只串正式行。零值的前、后不写进库，首行因此没有「前」。
 // 插入来源、最近编辑、编辑来源是已入链主张的可恢复出处；缺省表示旧数据或尚无来源。
 type Line struct {
-	ID           ID             `bson:"_id" json:"id"`
-	Prev         ID             `bson:"前,omitempty" json:"prev"`
-	Next         ID             `bson:"后,omitempty" json:"next"`
-	Content      string         `bson:"内容" json:"content"`
-	InsertOrigin *InsertOrigin  `bson:"插入来源,omitempty" json:"insertOrigin,omitempty"`
-	RecentEdit   *RecentEdit    `bson:"最近编辑,omitempty" json:"recentEdit,omitempty"`
-	EditOrigin   *EditOrigin    `bson:"编辑来源,omitempty" json:"editOrigin,omitempty"`
+	ID           ID            `bson:"_id" json:"id"`
+	Prev         ID            `bson:"前,omitempty" json:"prev"`
+	Next         ID            `bson:"后,omitempty" json:"next"`
+	Content      string        `bson:"内容" json:"content"`
+	InsertOrigin *InsertOrigin `bson:"插入来源,omitempty" json:"insertOrigin,omitempty"`
+	RecentEdit   *RecentEdit   `bson:"最近编辑,omitempty" json:"recentEdit,omitempty"`
+	EditOrigin   *EditOrigin   `bson:"编辑来源,omitempty" json:"editOrigin,omitempty"`
 }
 
 // InsertOrigin 挂在插入段首行：谁插入、锚在哪、方向、原边界、段内行、最初整段。
@@ -72,6 +72,7 @@ type Dispute struct {
 	RealLine  ID               `bson:"真实行" json:"realLine"`
 	Action    string           `bson:"做法" json:"action"`
 	Person    string           `bson:"人" json:"person"`
+	Target    string           `bson:"收件人,omitempty" json:"target,omitempty"`
 	Content   []string         `bson:"内容" json:"content"`
 	BaseIDs   []ID             `bson:"基准行,omitempty" json:"baseIDs,omitempty"`
 	Followers []string         `bson:"追随者" json:"followers"`

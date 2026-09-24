@@ -28,6 +28,7 @@ import {
   DeleteLine,
   MergeUp,
   MoveCaretRange,
+  RejectClaim,
   RequestFollow,
   SubmitEdit,
   SubmitEditClaim,
@@ -880,6 +881,17 @@ async function confirmFollow() {
   finally { following.value = false }
 }
 
+async function confirmReject() {
+  if (!followTarget.value || following.value) return
+  following.value = true
+  try {
+    await prepareLeave()
+    await trackSubmit(RejectClaim(followTarget.value))
+    followTarget.value = ''
+  } catch (e) { showError(e) }
+  finally { following.value = false }
+}
+
 defineExpose({ prepareLeave, focus: () => view?.focus() })
 
 function runHistory(v: EditorView, command: StateCommand): boolean {
@@ -1126,7 +1138,7 @@ watch(
   <div ref="host" class="single-editor" />
   <ModalDialog :model-value="!!followTarget" title="接受这份主张" :busy="following" @update:model-value="followTarget = ''">
     <p>接受他的主张，放弃我的？</p>
-    <div class="actions"><button :disabled="following" @click="confirmFollow">接受</button><button class="quiet" :disabled="following" autofocus @click="followTarget = ''">取消</button></div>
+    <div class="actions"><button :disabled="following" @click="confirmFollow">接受</button><button class="quiet" :disabled="following" @click="confirmReject">拒绝</button><button class="quiet" :disabled="following" autofocus @click="followTarget = ''">取消</button></div>
   </ModalDialog>
 </template>
 
