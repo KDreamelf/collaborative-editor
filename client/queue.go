@@ -19,6 +19,16 @@ func (a *App) pushOpLocked(op protocol.Op) error {
 	if op.ID == "" {
 		op.ID = model.NewID().Hex()
 	}
+	if op.Kind == protocol.TypeDisputeCC && op.DisputeCC != nil && op.DisputeCC.Claim.Person == a.personID {
+		if a.ownSent == nil {
+			a.ownSent = map[string]model.Dispute{}
+		}
+		claim := op.DisputeCC.Claim
+		a.ownSent[claimSlotKey(claim.RealLine, claim.Action)] = claim
+	}
+	if a.relayBooted {
+		a.markRelaySeenLocked(op.ID)
+	}
 	now := time.Now()
 	if len(a.queue) == a.sentCount {
 		a.oldestAt = now
@@ -193,6 +203,8 @@ func (a *App) connect() error {
 	a.conn = conn
 	a.sentCount = 0
 	a.sentSeq = 0
+	a.relayReady = false
+	a.preboot = nil
 	join := protocol.Join{
 		Type:      protocol.TypeJoin,
 		ArticleID: articleID,
@@ -282,6 +294,24 @@ func (a *App) handleMessage(data []byte, gen uint64) {
 			return
 		}
 		a.onSnapshot(snap, gen)
+	case protocol.TypeBootstrap:
+		var boot protocol.Bootstrap
+		if err := json.Unmarshal(data, &boot); err != nil {
+			return
+		}
+		a.onBootstrap(boot, gen)
+	case protocol.TypeRelay:
+		var ev protocol.RelayEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return
+		}
+		a.onRelay(ev, gen)
+	case protocol.TypeCursor:
+		var msg protocol.CursorMsg
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return
+		}
+		a.onCursor(msg.Cursor, gen)
 	case protocol.TypeCursors:
 		var msg struct {
 			Cursors []protocol.Cursor `json:"cursors"`
@@ -429,6 +459,11 @@ func (a *App) onSnapshot(snap protocol.Snapshot, gen uint64) {
 	if a.connGen != gen {
 		return
 	}
+	// 中立已入场：Join 的 Snapshot 只更新在场信息，不可覆盖本机正文。
+	if a.relayBooted || a.relayReady {
+		a.onPresenceSnapshotLocked(snap)
+		return
+	}
 	doc, err := document.Load(snap.Article, snap.Lines, snap.Disputes)
 	if err != nil {
 		if a.ctx != nil {
@@ -464,8 +499,45 @@ func (a *App) onSnapshot(snap protocol.Snapshot, gen uint64) {
 	}
 }
 
-// replayQueueLocked 重放待送 Op。本地失败只留可复制草稿（按 OpID 去重），不剥队列；
-// 送达以服务端 ack 为准，避免 sentCount 与队列错位。
+// onPresenceSnapshotLocked 更新在线人员；新参与者的系统空行按服务端 ID 补到尾部。
+func (a *App) onPresenceSnapshotLocked(snap protocol.Snapshot) {
+	a.people = snap.People
+	a.cursors = snap.Cursors
+	if a.adoptTrailingEmptyLinesLocked(snap) {
+		a.persistAfterMutationLocked()
+	}
+	a.emitSnapshotLocked()
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "cursors", a.cursors)
+	}
+}
+
+func (a *App) adoptTrailingEmptyLinesLocked(snap protocol.Snapshot) bool {
+	if a.doc == nil {
+		return false
+	}
+	local, err := a.doc.View()
+	if err != nil || local.Article.ID != snap.Article.ID || len(snap.Lines) <= len(local.Lines) {
+		return false
+	}
+	for i, ln := range local.Lines {
+		if snap.Lines[i].ID != ln.ID {
+			return false
+		}
+	}
+	extra := snap.Lines[len(local.Lines):]
+	ids := make([]model.ID, len(extra))
+	for i, ln := range extra {
+		if ln.ID.IsZero() || ln.Content != "" {
+			return false
+		}
+		ids[i] = ln.ID
+	}
+	return a.doc.AppendPlainBlankIDs(ids) == nil
+}
+
+// replayQueueLocked 旧 Snapshot 路径重放待送 Op（会走 SubmitWith 自动争议分支）。
+// 中立 Bootstrap 用 replayUnackedPlainLocked，勿再调此函数处理普通同步。
 func (a *App) replayQueueLocked() {
 	if len(a.queue) == 0 {
 		return
@@ -483,6 +555,145 @@ func (a *App) replayQueueLocked() {
 	}
 	if changed {
 		a.emitUnsyncedLocked()
+	}
+}
+
+// replayUnackedPlainLocked Bootstrap 后重放未 ACK 普通 Op 到新链。
+// 有 foreign 候选：纯函数已留本人内容，不再 ApplyPlain 以免重复写正式链。
+// 无 foreign：ApplyPlain*（预生行 ID 已在则幂等）。CC/Follow/Answer 只留 queue 重发，不凭空开 UI 争议。
+func (a *App) replayUnackedPlainLocked() {
+	if a.doc == nil || len(a.queue) == 0 {
+		return
+	}
+	changed := false
+	for _, op := range a.queue {
+		switch op.Kind {
+		case protocol.TypeDisputeCC, protocol.TypeFollow, protocol.TypeFollowAnswer:
+			continue
+		case protocol.TypeSubmit, protocol.TypeDelete, protocol.TypeMerge, protocol.TypeSpanEdit:
+			if a.queueOpHasForeignLocked(op) {
+				continue
+			}
+			if err := a.applyPlainOpLocked(op); err != nil {
+				a.upsertRejectedByOpIDLocked(op, "本地无法重放该修改，原文已保存在未同步修改中")
+				changed = true
+				continue
+			}
+			if a.removeRejectedByOpIDLocked(op.ID) {
+				changed = true
+			}
+		default:
+			continue
+		}
+	}
+	if changed {
+		a.emitUnsyncedLocked()
+	}
+}
+
+func (a *App) queueOpHasForeignLocked(op protocol.Op) bool {
+	switch op.Kind {
+	case protocol.TypeSubmit:
+		if op.Submit == nil {
+			return false
+		}
+		id, err := model.ParseID(op.Submit.LineID)
+		if err != nil {
+			return false
+		}
+		action := op.Submit.Action
+		if model.IsInsertAction(action) {
+			action = model.InsertAction(action)
+		}
+		return a.hasForeignDisputeLocked(id, action)
+	case protocol.TypeDelete:
+		if op.Delete == nil {
+			return false
+		}
+		id, err := model.ParseID(op.Delete.LineID)
+		if err != nil {
+			return false
+		}
+		return a.hasForeignDisputeLocked(id, model.ActionDelete)
+	case protocol.TypeMerge:
+		if op.Merge == nil {
+			return false
+		}
+		id, err := model.ParseID(op.Merge.LineID)
+		if err != nil {
+			return false
+		}
+		return a.hasForeignDisputeLocked(id, model.ActionEdit)
+	case protocol.TypeSpanEdit:
+		if op.SpanEdit == nil {
+			return false
+		}
+		for _, raw := range op.SpanEdit.BaseIDs {
+			id, err := model.ParseID(raw)
+			if err != nil {
+				continue
+			}
+			if a.hasForeignDisputeLocked(id, model.ActionEdit) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (a *App) applyPlainOpLocked(op protocol.Op) error {
+	switch op.Kind {
+	case protocol.TypeSubmit:
+		s := op.Submit
+		if s == nil {
+			return nil
+		}
+		id, err := model.ParseID(s.LineID)
+		if err != nil {
+			return err
+		}
+		var lineIDs []model.ID
+		if len(s.LineIDs) > 0 {
+			lineIDs = make([]model.ID, len(s.LineIDs))
+			for i, raw := range s.LineIDs {
+				lid, err := model.ParseID(raw)
+				if err != nil {
+					return err
+				}
+				lineIDs[i] = lid
+			}
+		}
+		return a.doc.ApplyPlainSubmit(s.PersonID, id, s.Action, append([]string(nil), s.Content...), lineIDs)
+	case protocol.TypeSpanEdit:
+		opts, err := protocol.ParseSpanEditOpts(op.SpanEdit)
+		if err != nil {
+			return err
+		}
+		return a.doc.ApplyPlainSpan(opts)
+	case protocol.TypeDelete:
+		d := op.Delete
+		if d == nil {
+			return nil
+		}
+		id, err := model.ParseID(d.LineID)
+		if err != nil {
+			return err
+		}
+		return a.doc.ApplyPlainDelete(id)
+	case protocol.TypeMerge:
+		m := op.Merge
+		if m == nil {
+			return nil
+		}
+		id, err := model.ParseID(m.LineID)
+		if err != nil {
+			return err
+		}
+		return a.doc.ApplyPlainMerge(id)
+	default:
+		return nil
 	}
 }
 
@@ -614,10 +825,11 @@ func (a *App) emitSnapshotLocked() {
 		return
 	}
 	snap := protocol.Snapshot{
-		Type:    protocol.TypeSnapshot,
-		View:    view,
-		People:  a.people,
-		Cursors: a.cursors,
+		Type:     protocol.TypeSnapshot,
+		YourLine: a.yourLine,
+		View:     view,
+		People:   a.people,
+		Cursors:  a.cursors,
 	}
 	runtime.EventsEmit(a.ctx, "snapshot", snap)
 }

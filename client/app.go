@@ -57,14 +57,16 @@ type App struct {
 	lastEnqAt  time.Time
 	flushTimer *time.Timer
 
-	// afterSeen / beforeSeen / lineBase：最后已应用的服务端快照里各正式行当时的后继、前驱与正文。乐观本地改动不写这里。
+	// afterSeen / beforeSeen / lineBase：仅旧服务模式用——最后已应用 serverSnap 的后继/前驱/正文；乐观本地改动不写这里。
+	// 中立转发（relayReady）发送基准改读本地 Doc 正式链，这三张表之后会删。
 	afterSeen  map[string]string
 	beforeSeen map[string]string
 	lineBase   map[string]string
 
-	stateDir       string // 空则用 UserConfigDir；测试可注入临时目录
-	sessions       map[string]*persistSession
-	lastArt        string
+	stateDir string // 空则用 UserConfigDir；测试可注入临时目录
+	sessions map[string]*persistSession
+	lastArt  string
+	// serverSnap：最近共享链缓存（Bootstrap.Base）；本端正文权威在 doc / persist Relay。
 	serverSnap     *protocol.Snapshot
 	rejected       []rejectedOp
 	saveWarning    string
@@ -72,6 +74,20 @@ type App struct {
 
 	// httpTimeout：HTTP/WS 握手时限；0 表示 10s。测试可注入短值。
 	httpTimeout time.Duration
+
+	// attentionLine / attentionActive：本机输入注意力，供后续远端同步判断是否需本人主张 CC。
+	attentionLine   string
+	attentionActive bool
+
+	// 在线中立转发（Bootstrap / Relay）状态；connect 发 Join 前清 relayReady/preboot。
+	relayReady bool
+	preboot    []protocol.RelayEvent
+	relaySeen  map[string]bool
+	claimIDs   map[string]model.ID      // 本人+行+Action 稳定主张 ID（key 已带 Action）
+	ownSent    map[string]model.Dispute // 已抄送的本人主张；收到他人主张时才放入争议视图
+	yourLine   string
+	// relayBooted：已收到过 relay Bootstrap，或从 persist Relay 恢复。切文档/切服务清掉。
+	relayBooted bool
 }
 
 func NewApp() *App {
@@ -224,6 +240,13 @@ func (a *App) clearServiceCacheLocked() {
 	a.nextSeq = 1
 	a.oldestAt = time.Time{}
 	a.lastEnqAt = time.Time{}
+	a.relayReady = false
+	a.preboot = nil
+	a.relaySeen = nil
+	a.claimIDs = nil
+	a.ownSent = nil
+	a.yourLine = ""
+	a.relayBooted = false
 }
 
 func (a *App) hasPendingAnywhereLocked() bool {
@@ -369,6 +392,13 @@ func (a *App) Join(articleID, name string) error {
 		a.afterSeen = nil
 		a.beforeSeen = nil
 		a.lineBase = nil
+		a.relayReady = false
+		a.preboot = nil
+		a.relaySeen = nil
+		a.claimIDs = nil
+		a.ownSent = nil
+		a.yourLine = ""
+		a.relayBooted = false
 		if a.conn != nil {
 			_ = a.conn.Close()
 			a.conn = nil
@@ -417,7 +447,7 @@ func (a *App) Join(articleID, name string) error {
 }
 
 func (a *App) hasTrustedLocalLocked() bool {
-	return a.serverSnap != nil || len(a.queue) > 0
+	return a.serverSnap != nil || len(a.queue) > 0 || a.relayBooted
 }
 
 func (a *App) emitOfflineLocked(offline bool) {
@@ -446,7 +476,8 @@ func (a *App) SubmitEditClaim(lineID string, lines []string) error {
 	return a.enqueueSubmit(lineID, model.ActionEdit, lines, true)
 }
 
-// SubmitSpanEdit 跨多条正式行整段替换。基准只取 serverSnap，一个范围一个 Op。
+// SubmitSpanEdit 跨多条正式行整段替换。一个范围一个 Op。
+// 中立转发取调用前本地 View；旧模式仍取 serverSnap（兼容，之后删）。
 func (a *App) SubmitSpanEdit(startLineID, endLineID string, replacement []string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -457,7 +488,17 @@ func (a *App) SubmitSpanEdit(startLineID, endLineID string, replacement []string
 		return fmt.Errorf("粘贴内容为空")
 	}
 	replacement = append([]string(nil), replacement...)
-	baseIDs, baseTexts, afterSeen, err := a.spanBasesFromServerSnapLocked(startLineID, endLineID)
+	var (
+		baseIDs   []model.ID
+		baseTexts []string
+		afterSeen model.ID
+		err       error
+	)
+	if a.relayReady || a.relayBooted {
+		baseIDs, baseTexts, afterSeen, err = a.spanBasesFromLocalViewLocked(startLineID, endLineID)
+	} else {
+		baseIDs, baseTexts, afterSeen, err = a.spanBasesFromServerSnapLocked(startLineID, endLineID)
+	}
 	if err != nil {
 		// 乐观新行常不在 serverSnap；保原文进 rejected，避免前端回滚丢字。
 		return a.saveLocalSpanRejectLocked(spanRejectDraftOp(a.personID, startLineID, endLineID, replacement))
@@ -497,6 +538,51 @@ func (a *App) SubmitSpanEdit(startLineID, endLineID string, replacement []string
 		AfterSeen:   afterSeen,
 		Replacement: replacement,
 		LineIDs:     lineIDs,
+	}
+	if a.relayBooted || a.relayReady {
+		v, err := a.doc.View()
+		if err != nil {
+			return err
+		}
+		var foreign *model.Dispute
+		for _, claim := range v.Disputes {
+			if claim.Person == a.personID {
+				continue
+			}
+			for i, baseID := range baseIDs {
+				if claim.RealLine != baseID {
+					continue
+				}
+				if i != 0 || claimSlotKey(claim.RealLine, claim.Action) != claimSlotKey(baseIDs[0], model.ActionEdit) {
+					return a.saveLocalSpanRejectLocked(op)
+				}
+				foreign = &claim
+				break
+			}
+		}
+		if foreign != nil {
+			working := a.doc.Clone()
+			if err := working.SubmitSpanEdit(a.personID, opts); err != nil {
+				return a.saveLocalSpanRejectLocked(op)
+			}
+			view, err := working.View()
+			if err != nil {
+				return err
+			}
+			for _, own := range view.Disputes {
+				if own.RealLine == baseIDs[0] && own.Person == a.personID && own.Action == model.ActionEdit {
+					a.doc = working
+					a.rememberClaimIDLocked(baseIDs[0].Hex(), own.Action, own.ID)
+					if err := a.pushOpLocked(protocol.Op{Kind: protocol.TypeDisputeCC,
+						DisputeCC: &protocol.DisputeCC{TargetPersonID: foreign.Person, Claim: own}}); err != nil {
+						return err
+					}
+					a.emitSnapshotLocked()
+					return nil
+				}
+			}
+			return a.saveLocalSpanRejectLocked(op)
+		}
 	}
 	if err := a.doc.SubmitSpanEdit(a.personID, opts); err != nil {
 		if errors.Is(err, document.ErrSpanBlocked) ||
@@ -546,8 +632,37 @@ func (a *App) DeleteLine(lineID string) error {
 	if err != nil {
 		return err
 	}
-	holders := a.holdersLocked(lineID)
-	if err := a.doc.DeleteIfIdle(a.personID, id, holders); err != nil {
+	if a.relayBooted || a.relayReady {
+		foreign, err := a.foreignClaimAtLocked(id)
+		if err != nil {
+			return err
+		}
+		if foreign != nil {
+			if err := a.doc.DeleteIfIdle(a.personID, id, nil); err != nil {
+				return err
+			}
+			v, err := a.doc.View()
+			if err != nil {
+				return err
+			}
+			for _, claim := range v.Disputes {
+				if claim.RealLine == id && claim.Person == a.personID && claim.Action == model.ActionDelete {
+					a.rememberClaimIDLocked(lineID, claim.Action, claim.ID)
+					if err := a.pushOpLocked(protocol.Op{Kind: protocol.TypeDisputeCC, DisputeCC: &protocol.DisputeCC{
+						TargetPersonID: foreign.Person, Claim: claim,
+					}}); err != nil {
+						return err
+					}
+					a.emitSnapshotLocked()
+					return nil
+				}
+			}
+			return document.ErrBroken
+		}
+		if err := a.doc.ApplyPlainDelete(id); err != nil {
+			return err
+		}
+	} else if err := a.doc.DeleteIfIdle(a.personID, id, a.holdersLocked(lineID)); err != nil {
 		return err
 	}
 	op := protocol.Op{
@@ -575,8 +690,11 @@ func (a *App) MergeUp(lineID string) error {
 	if err != nil {
 		return err
 	}
-	holders := a.holdersLocked(lineID)
-	if err := a.doc.MergeUp(a.personID, id, holders); err != nil {
+	if a.relayBooted || a.relayReady {
+		if err := a.doc.ApplyPlainMerge(id); err != nil {
+			return err
+		}
+	} else if err := a.doc.MergeUp(a.personID, id, a.holdersLocked(lineID)); err != nil {
 		return err
 	}
 	op := protocol.Op{
@@ -599,9 +717,11 @@ func (a *App) MoveCaret(lineID, disputeID string, offset, selEnd int) error {
 }
 
 // MoveCaretRange 跨行/分段选区光标；零值字段兼容旧 Cursor。
+// 本机注意力按起点行立即更新，不依赖光标报文是否发出。
 func (a *App) MoveCaretRange(lineID, disputeID string, partIndex, offset int, selEndLineID, selEndDisputeID string, selEndPartIndex, selEnd int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.setAttentionFromCaretLocked(lineID, disputeID)
 	msg := protocol.CursorMsg{
 		Type: protocol.TypeCursor,
 		Cursor: protocol.Cursor{
@@ -620,6 +740,106 @@ func (a *App) MoveCaretRange(lineID, disputeID string, partIndex, offset int, se
 	return a.sendAfterEditsLocked(msg)
 }
 
+func (a *App) setAttentionFromCaretLocked(lineID, disputeID string) {
+	a.attentionLine = lineID
+	if lineID == "" {
+		a.attentionActive = false
+		return
+	}
+	if disputeID == "" {
+		a.attentionActive = true
+		return
+	}
+	a.attentionActive = a.selfOwnsDisputeLocked(disputeID)
+}
+
+// disputeRealLineHexLocked 取主张 RealLine；追随 apply 前调用（收口后争议可能已消失）。
+func (a *App) disputeRealLineHexLocked(disputeID model.ID) string {
+	if a.doc == nil || disputeID.IsZero() {
+		return ""
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return ""
+	}
+	for _, d := range v.Disputes {
+		if d.ID == disputeID {
+			return d.RealLine.Hex()
+		}
+	}
+	return ""
+}
+
+// deactivateAttentionIfOnLineLocked 追随放下主张：同行仅失活注意力，不清空光标行。
+func (a *App) deactivateAttentionIfOnLineLocked(lineHex string) {
+	if lineHex != "" && a.attentionLine == lineHex {
+		a.attentionActive = false
+	}
+}
+
+func (a *App) selfOwnsDisputeLocked(disputeID string) bool {
+	if a.doc == nil || a.personID == "" {
+		return false
+	}
+	id, err := model.ParseID(disputeID)
+	if err != nil || id.IsZero() {
+		return false
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return false
+	}
+	for _, d := range v.Disputes {
+		if d.ID == id && d.Person == a.personID {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) hasForeignDisputeLocked(line model.ID, action string) bool {
+	if a.doc == nil {
+		return false
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return false
+	}
+	for _, d := range v.Disputes {
+		if d.RealLine == line && d.Action == action && d.Person != a.personID {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) foreignClaimAtLocked(line model.ID) (*model.Dispute, error) {
+	v, err := a.doc.View()
+	if err != nil {
+		return nil, err
+	}
+	for _, claim := range v.Disputes {
+		if claim.RealLine == line && claim.Person != a.personID {
+			return &claim, nil
+		}
+	}
+	return nil, nil
+}
+
+func (a *App) foreignClaimForSlotLocked(line model.ID, action string) (*model.Dispute, error) {
+	v, err := a.doc.View()
+	if err != nil {
+		return nil, err
+	}
+	slot := claimSlotKey(line, action)
+	for _, claim := range v.Disputes {
+		if claim.Person != a.personID && claimSlotKey(claim.RealLine, claim.Action) == slot {
+			return &claim, nil
+		}
+	}
+	return nil, nil
+}
+
 func (a *App) Suspend(lineID, action string, on bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -629,6 +849,13 @@ func (a *App) Suspend(lineID, action string, on bool) error {
 	id, err := model.ParseID(lineID)
 	if err != nil {
 		return err
+	}
+	if lineID == a.attentionLine {
+		a.attentionActive = !on
+	}
+	// 无外来候选时只动注意力，避免单人 live 被 SetSuspended 转成 solo Dispute。
+	if !a.hasForeignDisputeLocked(id, action) {
+		return nil
 	}
 	if err := a.doc.SetSuspended(a.personID, id, action, on); err != nil {
 		return err
@@ -661,7 +888,8 @@ func (a *App) RequestFollow(disputeID string) error {
 		return err
 	}
 	ts := time.Now().UnixMilli()
-	if _, err := a.doc.RequestFollow(a.personID, id, ts); err != nil {
+	out, err := a.doc.RequestFollow(a.personID, id, ts)
+	if err != nil {
 		return err
 	}
 	if err := a.pushOpLocked(protocol.Op{
@@ -677,6 +905,7 @@ func (a *App) RequestFollow(disputeID string) error {
 	}
 	a.forceFlushLocked()
 	a.emitSnapshotLocked()
+	a.emitFollowResultLocked(out.Status, disputeID)
 	return nil
 }
 
@@ -741,6 +970,35 @@ func (a *App) enqueueSubmit(lineID, action string, content []string, wholeClaim 
 			WholeClaim:  wholeClaim,
 		},
 	}
+	if a.relayBooted || a.relayReady {
+		foreign, err := a.foreignClaimForSlotLocked(id, action)
+		if err != nil {
+			return err
+		}
+		if foreign != nil {
+			working := a.doc.Clone()
+			if err := working.SubmitWith(a.personID, id, action, content, opts); err != nil {
+				return a.saveLocalSpanRejectLocked(op)
+			}
+			v, err := working.View()
+			if err != nil {
+				return err
+			}
+			for _, own := range v.Disputes {
+				if own.Person == a.personID && claimSlotKey(own.RealLine, own.Action) == claimSlotKey(id, action) {
+					a.doc = working
+					a.rememberClaimIDLocked(lineID, own.Action, own.ID)
+					if err := a.pushOpLocked(protocol.Op{Kind: protocol.TypeDisputeCC,
+						DisputeCC: &protocol.DisputeCC{TargetPersonID: foreign.Person, Claim: own}}); err != nil {
+						return err
+					}
+					a.emitSnapshotLocked()
+					return nil
+				}
+			}
+			return a.saveLocalSpanRejectLocked(op)
+		}
+	}
 	if err := a.doc.SubmitWith(a.personID, id, action, content, opts); err != nil {
 		return a.saveLocalSpanRejectLocked(op)
 	}
@@ -751,12 +1009,8 @@ func (a *App) enqueueSubmit(lineID, action string, content []string, wholeClaim 
 	return nil
 }
 
-// spanBasesFromServerSnapLocked：两端及中间基准只来自最后已应用 serverSnap，不看乐观 doc。
-func (a *App) spanBasesFromServerSnapLocked(startHex, endHex string) ([]model.ID, []string, model.ID, error) {
-	if a.serverSnap == nil {
-		return nil, nil, model.ID{}, document.ErrSpanBase
-	}
-	lines := a.serverSnap.Lines
+// spanBasesFromLinesLocked：从已排序正式行切片取跨度基准（调用前快照，不含本次乐观结果）。
+func spanBasesFromLinesLocked(lines []model.Line, startHex, endHex string) ([]model.ID, []string, model.ID, error) {
 	startIdx, endIdx := -1, -1
 	for i, ln := range lines {
 		h := ln.ID.Hex()
@@ -784,38 +1038,90 @@ func (a *App) spanBasesFromServerSnapLocked(startHex, endHex string) ([]model.ID
 	return baseIDs, baseTexts, lines[endIdx].Next, nil
 }
 
-// buildSubmitExtrasLocked：基准后继/前驱/正文只取服务端快照；新行 ID 客户端预生。
+// spanBasesFromLocalViewLocked：中立转发——跨度基准取调用前本地 Doc 正式链。
+func (a *App) spanBasesFromLocalViewLocked(startHex, endHex string) ([]model.ID, []string, model.ID, error) {
+	if a.doc == nil {
+		return nil, nil, model.ID{}, document.ErrSpanBase
+	}
+	v, err := a.doc.View()
+	if err != nil {
+		return nil, nil, model.ID{}, document.ErrSpanBase
+	}
+	return spanBasesFromLinesLocked(v.Lines, startHex, endHex)
+}
+
+// spanBasesFromServerSnapLocked：旧模式兼容——两端及中间基准只来自最后已应用 serverSnap，不看乐观 doc。之后删。
+func (a *App) spanBasesFromServerSnapLocked(startHex, endHex string) ([]model.ID, []string, model.ID, error) {
+	if a.serverSnap == nil {
+		return nil, nil, model.ID{}, document.ErrSpanBase
+	}
+	return spanBasesFromLinesLocked(a.serverSnap.Lines, startHex, endHex)
+}
+
+// buildSubmitExtrasLocked：组装 SubmitOpts 与包字段。新行 ID 客户端预生。
+// 中立转发（relayReady）：AfterSeen/BeforeSeen/BaseContent 取调用前本地 View 正式链。
+// 旧模式：仍取 serverSnap 映射（兼容旧服务测试，之后删）。
 func (a *App) buildSubmitExtrasLocked(lineID, action string, content []string) (document.SubmitOpts, *string, *string, *string, []string) {
 	var opts document.SubmitOpts
 	var afterPtr *string
 	var beforePtr *string
 	var basePtr *string
 	var idStrs []string
-	if action == model.ActionInsert && a.afterSeen != nil {
-		if next, ok := a.afterSeen[lineID]; ok {
-			cp := next
-			afterPtr = &cp
-			seen, err := model.ParseID(next)
-			if err == nil {
-				opts.AfterSeen = &seen
+	if a.relayReady || a.relayBooted {
+		if a.doc != nil {
+			if v, err := a.doc.View(); err == nil {
+				for _, ln := range v.Lines {
+					if ln.ID.Hex() != lineID {
+						continue
+					}
+					switch action {
+					case model.ActionInsert:
+						next := ln.Next.Hex()
+						afterPtr = &next
+						seen := ln.Next
+						opts.AfterSeen = &seen
+					case model.ActionInsertBefore:
+						prev := ln.Prev.Hex()
+						beforePtr = &prev
+						seen := ln.Prev
+						opts.BeforeSeen = &seen
+					case model.ActionEdit:
+						cp := ln.Content
+						basePtr = &cp
+						opts.BaseContent = &cp
+					}
+					break
+				}
 			}
 		}
-	}
-	if action == model.ActionInsertBefore && a.beforeSeen != nil {
-		if prev, ok := a.beforeSeen[lineID]; ok {
-			cp := prev
-			beforePtr = &cp
-			seen, err := model.ParseID(prev)
-			if err == nil {
-				opts.BeforeSeen = &seen
+	} else {
+		// 旧模式兼容：基准仍取最后已应用 serverSnap 映射。
+		if action == model.ActionInsert && a.afterSeen != nil {
+			if next, ok := a.afterSeen[lineID]; ok {
+				cp := next
+				afterPtr = &cp
+				seen, err := model.ParseID(next)
+				if err == nil {
+					opts.AfterSeen = &seen
+				}
 			}
 		}
-	}
-	if action == model.ActionEdit && a.lineBase != nil {
-		if text, ok := a.lineBase[lineID]; ok {
-			cp := text
-			basePtr = &cp
-			opts.BaseContent = &cp
+		if action == model.ActionInsertBefore && a.beforeSeen != nil {
+			if prev, ok := a.beforeSeen[lineID]; ok {
+				cp := prev
+				beforePtr = &cp
+				seen, err := model.ParseID(prev)
+				if err == nil {
+					opts.BeforeSeen = &seen
+				}
+			}
+		}
+		if action == model.ActionEdit && a.lineBase != nil {
+			if text, ok := a.lineBase[lineID]; ok {
+				cp := text
+				basePtr = &cp
+				opts.BaseContent = &cp
+			}
 		}
 	}
 	n := 0

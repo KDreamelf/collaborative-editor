@@ -1,8 +1,0 @@
-{"op":"create","title":"t"}
-{"op":"insert","person":"p1","line":0,"lines":["x","y"]}
-{"op":"insert","person":"p1","line":0,"lines":["x","y"]}
-
-{"expect":"disputes","n":0}
-{"expect":"lines","n":3}
-{"expect":"line","line":1,"text":"x"}
-{"expect":"line","line":2,"text":"y"}

@@ -27,6 +27,9 @@ const (
 	TypeCursors      = "cursors"
 	TypeAck          = "ack"
 	TypeError        = "error"
+	TypeDisputeCC    = "disputeCC"
+	TypeRelay        = "relay"
+	TypeBootstrap    = "bootstrap"
 )
 
 type Person struct {
@@ -92,7 +95,7 @@ type SpanEdit struct {
 // ID 由客户端生成，服务端按它去重，重连重发不会再执行一遍。
 type Op struct {
 	ID           string        `json:"id,omitempty"`
-	Kind         string        `json:"kind"` // submit、spanEdit、delete、merge、follow、followAnswer、suspend
+	Kind         string        `json:"kind"` // submit、spanEdit、delete、merge、follow、followAnswer、suspend、disputeCC
 	Submit       *Submit       `json:"submit,omitempty"`
 	SpanEdit     *SpanEdit     `json:"spanEdit,omitempty"`
 	Delete       *Delete       `json:"delete,omitempty"`
@@ -100,6 +103,7 @@ type Op struct {
 	Follow       *Follow       `json:"follow,omitempty"`
 	FollowAnswer *FollowAnswer `json:"followAnswer,omitempty"`
 	Suspend      *Suspend      `json:"suspend,omitempty"`
+	DisputeCC    *DisputeCC    `json:"disputeCC,omitempty"`
 }
 
 // ParseSpanEditOpts 把协议包转成领域参数；空字段/非法 ID 与领域校验一致。

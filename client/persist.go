@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,16 @@ type persistSession struct {
 	Queue    []protocol.Op      `json:"queue"`
 	Snapshot *protocol.Snapshot `json:"snapshot,omitempty"`
 	Rejected []rejectedOp       `json:"rejected,omitempty"`
+	// Relay：中立客户端本端主观视图；旧 Snapshot 仍是服务器 Base。
+	Relay *persistRelay `json:"relay,omitempty"`
+}
+
+// persistRelay 本端已收到 relay Bootstrap 后才写入。
+type persistRelay struct {
+	View     document.View     `json:"view"`
+	Seen     []string          `json:"seen,omitempty"`
+	ClaimIDs map[string]string `json:"claimIds,omitempty"`
+	YourLine string            `json:"yourLine,omitempty"`
 }
 
 // rejectedOp 服务端明确拒绝、保留原文的未同步修改。
@@ -240,17 +251,107 @@ func (a *App) stashSessionLocked() {
 	if seq <= 0 {
 		seq = 1
 	}
-	a.sessions[a.articleID] = &persistSession{
+	sess := &persistSession{
 		Name:     a.name,
 		NextSeq:  seq,
 		Queue:    q,
 		Snapshot: snap,
 		Rejected: rej,
 	}
+	if a.relayBooted && a.doc != nil {
+		if v, err := a.doc.View(); err == nil {
+			sess.Relay = &persistRelay{
+				View:     v,
+				Seen:     relaySeenList(a.relaySeen),
+				ClaimIDs: claimIDsToHex(a.claimIDs),
+				YourLine: a.yourLine,
+			}
+		}
+	}
+	a.sessions[a.articleID] = sess
+}
+
+func relaySeenList(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for id, ok := range m {
+		if ok && id != "" {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func relaySeenMap(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func claimIDsToHex(m map[string]model.ID) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, id := range m {
+		if id.IsZero() {
+			continue
+		}
+		out[k] = id.Hex()
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func claimIDsFromHex(m map[string]string) map[string]model.ID {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ID, len(m))
+	for k, hex := range m {
+		id, err := model.ParseID(hex)
+		if err != nil || id.IsZero() {
+			continue
+		}
+		out[k] = id
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func applySuspended(doc *document.Doc, suspended []string) {
+	for _, id := range suspended {
+		did, err := model.ParseID(id)
+		if err != nil || did.IsZero() {
+			continue
+		}
+		if d := findDispute(doc, did); d != nil {
+			_ = doc.SetSuspended(d.Person, d.RealLine, d.Action, true)
+		}
+	}
 }
 
 func (a *App) restoreSessionLocked(articleID string) {
 	sess := a.sessions[articleID]
+	a.relayBooted = false
+	a.relaySeen = nil
+	a.claimIDs = nil
+	a.ownSent = nil
+	a.yourLine = ""
 	if sess == nil {
 		a.queue = nil
 		a.rejected = nil
@@ -283,17 +384,34 @@ func (a *App) restoreSessionLocked(articleID string) {
 	if sess.Snapshot != nil {
 		cp := *sess.Snapshot
 		a.serverSnap = &cp
+	}
+	if sess.Relay != nil {
+		v := sess.Relay.View
+		doc, err := document.Load(v.Article, v.Lines, v.Disputes)
+		if err == nil {
+			applySuspended(doc, v.Suspended)
+			a.doc = doc
+			a.relayBooted = true
+			a.relaySeen = relaySeenMap(sess.Relay.Seen)
+			a.claimIDs = claimIDsFromHex(sess.Relay.ClaimIDs)
+			a.yourLine = sess.Relay.YourLine
+			if a.serverSnap != nil {
+				a.people = a.serverSnap.People
+				a.cursors = a.serverSnap.Cursors
+				a.rememberAfterSeenLocked(a.serverSnap.Lines)
+			}
+			// Relay View 已含乐观队列，勿 replayQueue。
+		}
+		if a.doc == nil {
+			a.doc = document.New("")
+		}
+		return
+	}
+	if a.serverSnap != nil {
+		cp := *a.serverSnap
 		doc, err := document.Load(cp.Article, cp.Lines, cp.Disputes)
 		if err == nil {
-			for _, id := range cp.Suspended {
-				did, err := model.ParseID(id)
-				if err != nil || did.IsZero() {
-					continue
-				}
-				if d := findDispute(doc, did); d != nil {
-					_ = doc.SetSuspended(d.Person, d.RealLine, d.Action, true)
-				}
-			}
+			applySuspended(doc, cp.Suspended)
 			a.rememberAfterSeenLocked(cp.Lines)
 			a.doc = doc
 			a.people = cp.People
@@ -318,7 +436,7 @@ func opPlainText(op protocol.Op) string {
 
 func (a *App) rememberServerSnapLocked(snap protocol.Snapshot) {
 	cp := snap
-	// 权威基线不含乐观重放；只存服务端原文。
+	// 最近共享链缓存；本端正文以 Doc/Relay View 为准。
 	a.serverSnap = &cp
 }
 
@@ -359,12 +477,14 @@ func (a *App) cachedArticleLocked() *CachedArticle {
 	if sess == nil {
 		return nil
 	}
-	if len(sess.Queue) == 0 && len(sess.Rejected) == 0 && sess.Snapshot == nil {
+	if len(sess.Queue) == 0 && len(sess.Rejected) == 0 && sess.Snapshot == nil && sess.Relay == nil {
 		return nil
 	}
 	title := "文档"
 	if sess.Snapshot != nil && sess.Snapshot.Article.Title != "" {
 		title = sess.Snapshot.Article.Title
+	} else if sess.Relay != nil && sess.Relay.View.Article.Title != "" {
+		title = sess.Relay.View.Article.Title
 	}
 	return &CachedArticle{
 		ID:            id,

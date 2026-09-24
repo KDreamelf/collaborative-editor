@@ -25,6 +25,8 @@ const ACTIONABLE: Record<string, string> = {
 
 const LOG_ID_RE = /E\d{8}-\d{6}-[0-9a-z]+/
 const LOG_ID_IN_MSG_RE = /日志编号\s+(E\d{8}-\d{6}-[0-9a-z]+)/
+/** Go onBootstrap 已 ReportError 后 emit 的唯一固定文案；原样显示，不二次落盘。 */
+const HOLD_RECONNECT_RE = /^本地内容已保留，正在重连，日志编号 E\d{8}-\d{6}-[0-9a-z]+$/
 
 function pad(n: number, w = 2): string {
   return String(n).padStart(w, '0')
@@ -75,6 +77,7 @@ export function formatUserError(e: unknown): string {
     .trim()
   if (KNOWN.has(msg)) return msg
   if (ACTIONABLE[msg]) return ACTIONABLE[msg]
+  if (HOLD_RECONNECT_RE.test(msg)) return msg
   const prior = existingLogId(msg)
   if (prior) {
     persistUnknown(prior, e)

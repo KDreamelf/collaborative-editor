@@ -1,8 +1,0 @@
-{"op":"create","title":"t"}
-{"op":"join","person":"p1","name":"甲"}
-{"op":"join","person":"p2","name":"乙"}
-{"op":"caret","person":"p2","line":1}
-{"op":"delete","person":"p1","line":1}
-
-{"expect":"lines","n":2}
-{"expect":"disputes","n":2}

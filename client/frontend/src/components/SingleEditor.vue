@@ -43,6 +43,8 @@ import {
   caretPosInRows,
   changedRange,
   cursorRowIndex,
+  enterAnchorsBefore,
+  insertEdgeCaretTarget,
   isValidFormalSpan,
   keyOffsetFromPos,
   posFromKeyOffset,
@@ -649,6 +651,7 @@ function placeStructuralCaret() {
   if (!view || !structuralCaret?.ready || rowsRef.length < structuralCaret.minRows) return
   const { row, part, offset, insert } = structuralCaret
   let index: number
+  // insert=true 仅「插在后面」；前插走 action 匹配，避免 before 误入 after 的 anchor+1。
   if (insert) {
     const candidate = rowsRef.findIndex((r) => r.lineId === row.lineId &&
       r.action === ACTION_INSERT && r.isSelf && !r.isContext)
@@ -659,6 +662,10 @@ function placeStructuralCaret() {
       (row.isContext ? r.isContext && r.contextAction === row.contextAction : !r.isContext) && r.partIndex === 0 &&
       r.action === row.action)
     index = head >= 0 ? head + part : -1
+    if (index < 0 && row.action === ACTION_INSERT_BEFORE) {
+      const anchor = rowsRef.findIndex((r) => r.isSelf && r.lineId === row.lineId)
+      if (anchor >= 0) index = Math.max(0, anchor - row.partCount) + part
+    }
   }
   if (index < 0 || index >= rowsRef.length || index >= view.state.doc.lines) return
   if (rowsRef[index].content !== structuralCaret.text) return
@@ -682,24 +689,64 @@ function replaceSelection(v: EditorView, inserted: string): boolean {
   return true
 }
 
-/** 行首锚定下方原行，行尾锚定上方原行；已有候选继续保留全文。 */
+/** 行首锚定下方原行，行尾锚定上方原行；已有候选继续保留全文。空行走 after。 */
 function applyInsertChange(rowIndex: number, before: boolean): TransactionSpec {
   const row = rowsRef[rowIndex]
   const action = before ? ACTION_INSERT_BEFORE : ACTION_INSERT
   const existing = rowsRef.map((r, i) => ({ r, i })).filter(({ r }) => r.lineId === row.lineId && r.action === action && r.isSelf && !r.isContext)
   const texts = existing.map(({ r, i }) => view?.state.doc.line(i + 1).text ?? r.content)
   const content = before ? [...texts, ''] : ['', ...texts]
-  const inserted: VisualRow = { ...row, key: 'insert:' + action + ':' + row.lineId + ':' + texts.length,
-    content: '', action, contextAction: undefined,
-    disputeId: existing[0]?.r.disputeId || '', followId: '', isContext: false,
-    partIndex: before ? texts.length : 0, partCount: content.length,
-    showLineNo: false, blockStart: false, separatorBefore: false }
-  const previous = rowsRef.map((r) => r.lineId === row.lineId && r.action === action && r.isSelf && !r.isContext ?
-    { ...r, partIndex: r.partIndex + (before ? 0 : 1), partCount: content.length } : r)
   const at = rowIndex + (before ? 0 : 1)
-  const next = [...previous.slice(0, at), inserted, ...previous.slice(at)]
+  const disputeId = existing[0]?.r.disputeId || ''
+  const optimistic = !disputeId
+  const newLineNo = before ? row.lineNo : row.lineNo + 1
+  const inserted: VisualRow = {
+    ...row,
+    key: 'insert:' + action + ':' + row.lineId + ':' + texts.length,
+    content: '',
+    action,
+    contextAction: undefined,
+    disputeId,
+    followId: '',
+    isContext: false,
+    partIndex: before ? texts.length : 0,
+    partCount: content.length,
+    showLineNo: optimistic,
+    lineNo: newLineNo,
+    zebra: (newLineNo - 1) % 2,
+    suspended: false,
+    gutterDots: [],
+    blockStart: false,
+    separatorBefore: false,
+  }
+  const previous = rowsRef.map((r) => r.lineId === row.lineId && r.action === action && r.isSelf && !r.isContext
+    ? { ...r, partIndex: r.partIndex + (before ? 0 : 1), partCount: content.length }
+    : r)
+  let next = [...previous.slice(0, at), inserted, ...previous.slice(at)]
+  if (optimistic) {
+    next = next.map((r, i) => {
+      if (i === at) return r
+      if (before && i > at && r.lineNo >= row.lineNo) {
+        return { ...r, lineNo: r.lineNo + 1, zebra: r.lineNo % 2 }
+      }
+      if (!before && i > at && r.lineNo > row.lineNo) {
+        return { ...r, lineNo: r.lineNo + 1, zebra: r.lineNo % 2 }
+      }
+      return r
+    })
+  }
   rowsRef = next
-  const target = { row, part: 0, offset: 0, insert: !before, ready: false, minRows: next.length, text: before ? row.content : '' }
+  // 初次 before：结构光标留下方原正式行，对齐 CM 行首 Enter（from+1）；勿锚上方新空行。
+  const edge = insertEdgeCaretTarget(before, row.content)
+  const target = {
+    row,
+    part: edge.part,
+    offset: 0,
+    insert: edge.insert,
+    ready: false,
+    minRows: next.length,
+    text: edge.text,
+  }
   structuralCaret = target
   void trackSubmit(before ? SubmitInsertBefore(row.lineId, content) : SubmitInsert(row.lineId, content)).then(async () => {
     target.ready = true
@@ -727,17 +774,38 @@ function applyUnitChange(doc: Text, from: number, to: number, inserted: string):
   const caret = caretAfterSpanInsert(start.text.slice(0, from - start.from), inserted)
   const first = indices[0]
   const head = rowsRef[first]
-  const next = [...rowsRef.slice(0, first), ...parts.map((content, partIndex) => ({
+  // 本人乐观插入（尚无 disputeId）：各临时行立刻占行号/斑马，避免闪无号。
+  const optimisticInsert = isInsertAction(head.action) && head.isSelf && !head.disputeId
+  const baseNo = head.lineNo
+  const grew = parts.length - indices.length
+  let next = [...rowsRef.slice(0, first), ...parts.map((content, partIndex) => ({
     ...head, content, partIndex, partCount: parts.length,
     key: partIndex === 0 ? head.key : head.key + ':part:' + partIndex,
-    showLineNo: partIndex === 0 && head.showLineNo,
+    showLineNo: optimisticInsert ? true : partIndex === 0 && head.showLineNo,
+    lineNo: optimisticInsert ? baseNo + partIndex : head.lineNo,
+    zebra: optimisticInsert ? (baseNo + partIndex - 1) % 2 : head.zebra,
     blockStart: partIndex === 0 && head.blockStart,
     separatorBefore: partIndex === 0 && head.separatorBefore,
   })), ...rowsRef.slice(indices[indices.length - 1] + 1)]
+  if (grew > 0 && optimisticInsert) {
+    const after = first + parts.length
+    next = next.map((r, i) => {
+      if (i < after || r.lineNo < baseNo + indices.length) return r
+      return { ...r, lineNo: r.lineNo + grew, zebra: (r.lineNo + grew - 1) % 2 }
+    })
+  }
   rowsRef = next
   if (!composing) {
-    const target = { row: head, part: row.partIndex + caret.part, offset: caret.offset,
-      insert: false, ready: false, minRows: next.length, text: parts[row.partIndex + caret.part] }
+    const target = {
+      row: { ...head, partCount: parts.length },
+      part: row.partIndex + caret.part,
+      offset: caret.offset,
+      // 仅 after 走 insert 分支；before 用 action 匹配，避免锚到 anchor+1。
+      insert: head.action === ACTION_INSERT,
+      ready: false,
+      minRows: next.length,
+      text: parts[row.partIndex + caret.part],
+    }
     structuralCaret = target
     void submitClaim(row, parts).then(async () => {
       target.ready = true
@@ -879,7 +947,8 @@ function buildExtensions(): Extension {
         const insertAtEdge = insert === '\n' && from === to && (from === line.to || from === line.from) &&
           row.action === ACTION_EDIT && row.partCount === 1 && !row.spanBaseIDs?.length &&
           !tr.isUserEvent('undo') && !tr.isUserEvent('redo')
-        spec = insertAtEdge ? applyInsertChange(line.number - 1, from === line.from) :
+        const before = enterAnchorsBefore(line.from === line.to, from === line.from)
+        spec = insertAtEdge ? applyInsertChange(line.number - 1, before) :
           applyUnitChange(tr.startState.doc, from, to, insert)
       } else {
         return tr

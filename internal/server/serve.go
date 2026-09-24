@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -9,30 +10,45 @@ import (
 
 func Main() {
 	addr := env("ADDR", ":8787")
-	uri := env("MONGO_URI", "mongodb://127.0.0.1:27017")
-	dbName := env("MONGO_DB", "editor")
-
-	var store articleStore
-	if s := connectMongo(uri, dbName); s != nil {
-		store = s
+	hub, err := openHub(os.Getenv("MONGO_URI"), os.Getenv("MONGO_DB"))
+	if err != nil {
+		log.Fatal(err)
 	}
-	hub := NewHub(store)
 	stop := make(chan struct{})
 	go hub.StartFlush(stop)
 
+	log.Printf("listen %s", addr)
+	if err := http.ListenAndServe(addr, hub.Handler()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// openHub：MONGO_URI 空=纯内存；非空则连 Mongo，失败直接返回（不降级）。
+func openHub(mongoURI, mongoDB string) (*Hub, error) {
+	if mongoURI == "" {
+		return NewHub(nil), nil
+	}
+	if mongoDB == "" {
+		mongoDB = "editor"
+	}
+	s := connectMongo(mongoURI, mongoDB)
+	if s == nil {
+		return nil, errors.New("mongo 不可用")
+	}
+	return NewHub(s), nil
+}
+
+// Handler 正式 HTTP/WS 入口（建文 + Join）。集成测试与 Main 共用。
+func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/articles", hub.handleCreate)
-	mux.HandleFunc("GET /api/articles", hub.handleList)
-	mux.HandleFunc("GET /api/articles/{id}", hub.handleGet)
-	mux.HandleFunc("GET /ws", hub.handleWS)
+	mux.HandleFunc("POST /api/articles", h.handleCreate)
+	mux.HandleFunc("GET /api/articles", h.handleList)
+	mux.HandleFunc("GET /api/articles/{id}", h.handleGet)
+	mux.HandleFunc("GET /ws", h.handleWS)
 	mux.HandleFunc("OPTIONS /api/articles", handleOptions)
 	mux.HandleFunc("OPTIONS /api/articles/{id}", handleOptions)
 	mux.HandleFunc("OPTIONS /ws", handleOptions)
-
-	log.Printf("listen %s", addr)
-	if err := http.ListenAndServe(addr, cors(mux)); err != nil {
-		log.Fatal(err)
-	}
+	return cors(mux)
 }
 
 func env(k, def string) string {

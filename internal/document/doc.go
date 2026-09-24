@@ -406,6 +406,66 @@ func cloneLive(live *liveClaim) *liveClaim {
 	}
 }
 
+// Clone 深拷贝当前 Doc，供服务端候选落盘试写等调用方使用。
+func (d *Doc) Clone() *Doc {
+	return d.cloneDoc()
+}
+
+// cloneDoc 深拷贝内部状态，仅供 ReceiveForeignInsertClaim 失败零突变。
+// live 与 insertHistory 若共享同一 *liveClaim，memo 保持别名；勿 View→Load。
+func (d *Doc) cloneDoc() *Doc {
+	out := &Doc{
+		article:       d.article,
+		lines:         make(map[model.ID]*model.Line, len(d.lines)),
+		disputes:      make(map[model.ID]*model.Dispute, len(d.disputes)),
+		suspended:     make(map[model.ID]bool, len(d.suspended)),
+		live:          make(map[claimKey]*liveClaim, len(d.live)),
+		insertHistory: make(map[claimKey][]*liveClaim, len(d.insertHistory)),
+		pending:       append([]followPend(nil), d.pending...),
+	}
+	for id, ln := range d.lines {
+		cp := copyLine(*ln)
+		out.lines[id] = &cp
+	}
+	for id, item := range d.disputes {
+		cp := *item
+		cp.Content = append([]string(nil), item.Content...)
+		cp.Followers = append([]string(nil), item.Followers...)
+		cp.BaseIDs = append([]model.ID(nil), item.BaseIDs...)
+		cp.Pending = nil
+		out.disputes[id] = &cp
+	}
+	for id, v := range d.suspended {
+		out.suspended[id] = v
+	}
+	memo := map[*liveClaim]*liveClaim{}
+	cloneMemo := func(live *liveClaim) *liveClaim {
+		if live == nil {
+			return nil
+		}
+		if cp, ok := memo[live]; ok {
+			return cp
+		}
+		cp := cloneLive(live)
+		memo[live] = cp
+		return cp
+	}
+	for k, live := range d.live {
+		out.live[k] = cloneMemo(live)
+	}
+	for k, hist := range d.insertHistory {
+		if len(hist) == 0 {
+			continue
+		}
+		cp := make([]*liveClaim, len(hist))
+		for i, s := range hist {
+			cp[i] = cloneMemo(s)
+		}
+		out.insertHistory[k] = cp
+	}
+	return out
+}
+
 // setInsertOrigin 写入段首出处。action 空/插在后面用 oldNext；插在前面用 oldPrev。
 func (d *Doc) setInsertOrigin(ids []model.ID, person string, anchor model.ID, action string, oldPrev, oldNext model.ID, content []string) {
 	if len(ids) == 0 {

@@ -303,8 +303,8 @@ export function buildVisualRows(snap: Snapshot | null, me: string): VisualRow[] 
     let body = disputes.filter((d) => d.realLine === line.id && isBodyAction(d.action))
     const inserts = disputes.filter((d) => d.realLine === line.id && d.action === ACTION_INSERT)
     const before = disputes.filter((d) => d.realLine === line.id && d.action === ACTION_INSERT_BEFORE)
-    // 本人挂起且等于正文的单份编辑已包含在插入上下文里，不再重复画一遍。
-    if ((inserts.length || before.length) && body.length === 1 && body[0].person === me &&
+    // 唯一本人改这行且内容与正式行相同：按普通正式行展示（挂起相同内容不成视觉争议）。
+    if (body.length === 1 && body[0].person === me &&
       body[0].action === ACTION_EDIT && body[0].content.length === 1 && body[0].content[0] === line.content) body = []
     const spanBaseIDs = body.find((d) => d.baseIDs && d.baseIDs.length >= 2)?.baseIDs
 

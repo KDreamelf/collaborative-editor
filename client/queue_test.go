@@ -752,12 +752,12 @@ func TestApplyOpReplayWholeClaim(t *testing.T) {
 		ID:   model.NewID().Hex(),
 		Kind: protocol.TypeSubmit,
 		Submit: &protocol.Submit{
-			Type:       protocol.TypeSubmit,
-			PersonID:   "甲",
-			LineID:     line.Hex(),
-			Action:     model.ActionEdit,
-			Content:    []string{"R"},
-			WholeClaim: true,
+			Type:        protocol.TypeSubmit,
+			PersonID:    "甲",
+			LineID:      line.Hex(),
+			Action:      model.ActionEdit,
+			Content:     []string{"R"},
+			WholeClaim:  true,
 			BaseContent: strPtr("P"),
 		},
 	}
@@ -869,3 +869,103 @@ func TestAfterSeenStillFromServerSnapshot(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// 正式中立：他端 Join 广播的 Snapshot 只更新在场信息，不覆盖本机正文。
+func TestRelaySnapshotBadChainLeavesDoc(t *testing.T) {
+	doc := document.New("art")
+	if err := doc.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v0, _ := doc.View()
+	if err := doc.Submit("甲", v0.Lines[0].ID, model.ActionEdit, []string{"稳住"}); err != nil {
+		t.Fatal(err)
+	}
+	vBefore, _ := doc.View()
+
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID = "甲"
+	app.articleID = "art"
+	app.doc = doc
+	app.relayBooted = true
+	app.relayReady = true
+	app.connGen = 3
+	app.people = []protocol.Person{{ID: "甲", Name: "甲"}}
+	app.attentionLine, app.attentionActive = v0.Lines[0].ID.Hex(), true
+	if err := app.SubmitEdit(v0.Lines[0].ID.Hex(), "继续写"); err != nil {
+		t.Fatal(err)
+	}
+	vBefore, _ = app.doc.View()
+	queueBefore := len(app.queue)
+
+	bogus := model.NewID()
+	snap := protocol.Snapshot{
+		Type: protocol.TypeSnapshot,
+		View: document.View{
+			Article: v0.Article,
+			Lines: []model.Line{
+				{ID: bogus, Content: "坏链头", Next: model.NewID()},
+			},
+		},
+		People:  []protocol.Person{{ID: "甲", Name: "甲"}, {ID: "乙", Name: "乙"}},
+		Cursors: []protocol.Cursor{{PersonID: "乙", Name: "乙", LineID: bogus.Hex()}},
+	}
+	app.onSnapshot(snap, 3)
+
+	vAfter, err := app.doc.View()
+	if err != nil {
+		t.Fatalf("坏链 Snapshot 破坏了 Doc: %v", err)
+	}
+	if len(vAfter.Lines) != len(vBefore.Lines) || vAfter.Lines[0].Content != "继续写" {
+		t.Fatalf("正文被改: before=%+v after=%+v", vBefore.Lines, vAfter.Lines)
+	}
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if len(app.people) != 2 {
+		t.Fatalf("状态仍应更新 People: %+v", app.people)
+	}
+	if len(app.cursors) != 1 || app.cursors[0].PersonID != "乙" {
+		t.Fatalf("状态仍应更新 Cursors: %+v", app.cursors)
+	}
+	if len(app.queue) != queueBefore || !app.attentionActive {
+		t.Fatalf("在场消息不得改变待发送文字和注意力: queue=%d attention=%v", len(app.queue), app.attentionActive)
+	}
+}
+
+func TestJoinSnapshotAddsOnlySystemBlankLine(t *testing.T) {
+	doc := document.New("t")
+	base, err := doc.View()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := NewAppWithStateDir(t.TempDir())
+	app.personID, app.doc, app.relayBooted, app.relayReady, app.connGen = "甲", doc, true, true, 1
+	line := base.Lines[0].ID
+	if err := app.SubmitEdit(line.Hex(), "我还在写"); err != nil {
+		t.Fatal(err)
+	}
+	app.attentionLine, app.attentionActive = line.Hex(), true
+	queued := len(app.queue)
+	serverDoc, err := document.Load(base.Article, base.Lines, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverDoc.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	serverView, _ := serverDoc.View()
+	snap := protocol.Snapshot{Type: protocol.TypeSnapshot, View: serverView,
+		People: []protocol.Person{{ID: "甲"}, {ID: "乙"}}}
+	app.onSnapshot(snap, 1)
+	v, err := app.doc.View()
+	if err != nil || len(v.Lines) != 2 || v.Lines[0].Content != "我还在写" ||
+		v.Lines[1].ID != serverView.Lines[1].ID || v.Lines[1].InsertOrigin != nil || len(v.Disputes) != 0 {
+		t.Fatalf("加入快照只补系统行，不覆盖本人输入: view=%+v err=%v", v, err)
+	}
+	if len(app.queue) != queued || !app.attentionActive || len(app.people) != 2 {
+		t.Fatalf("加入快照不应改队列或注意力: queue=%d attention=%v people=%+v", len(app.queue), app.attentionActive, app.people)
+	}
+	app.onSnapshot(snap, 1)
+	if len(appView(t, app).Lines) != 2 {
+		t.Fatal("重复快照不应再补一行")
+	}
+}

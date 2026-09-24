@@ -3,6 +3,7 @@ package document
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"testing"
 
 	"github.com/KDreamelf/collaborative-editor/internal/model"
@@ -1943,5 +1944,1031 @@ func TestLoadLegacyLinesWithoutOrigin(t *testing.T) {
 	}
 	if len(d.insertHistory) != 0 || len(d.live) != 0 {
 		t.Fatalf("无字段旧数据不应造 live/history")
+	}
+}
+
+func TestEditBelief(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	got, err := d.EditBelief("甲", line)
+	if err != nil || len(got) != 1 || got[0] != "" {
+		t.Fatalf("空正式行: %v %+v", err, got)
+	}
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"本地"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.EditBelief("甲", line)
+	if err != nil || len(got) != 1 || got[0] != "本地" {
+		t.Fatalf("live: %v %+v", err, got)
+	}
+	got[0] = "篡改"
+	got2, _ := d.EditBelief("甲", line)
+	if got2[0] != "本地" {
+		t.Fatal("应返回副本")
+	}
+	ownID := model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"远端"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.EditBelief("甲", line)
+	if err != nil || len(got) != 1 || got[0] != "本地" {
+		t.Fatalf("已登记候选优先: %v %+v", err, got)
+	}
+	if _, err := d.EditBelief("甲", model.NewID()); err != ErrLine {
+		t.Fatalf("缺行: %v", err)
+	}
+}
+
+func TestInsertBelief(t *testing.T) {
+	d := New("t")
+	anchor := view(t, d).Lines[0].ID
+	got, err := d.InsertBelief("甲", anchor, model.ActionInsert)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("无插入应空: %v %+v", err, got)
+	}
+	id1, id2 := model.NewID(), model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A1", "A2"}, SubmitOpts{
+		AfterSeen: &model.ID{},
+		LineIDs:   []model.ID{id1, id2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.InsertBelief("甲", anchor, model.ActionInsert)
+	if err != nil || len(got) != 2 || got[0] != "A1" || got[1] != "A2" {
+		t.Fatalf("live 多行: %v %+v", err, got)
+	}
+	got[0] = "篡改"
+	got2, _ := d.InsertBelief("甲", anchor, model.ActionInsert)
+	if got2[0] != "A1" {
+		t.Fatal("应返回副本")
+	}
+	formal := view(t, d).Lines[0].Content
+	if formal == "A1" {
+		t.Fatal("锚点正式正文不应变成插入段")
+	}
+
+	id3 := model.NewID()
+	if err := d.SubmitWith("乙", anchor, model.ActionInsert, []string{"B"}, SubmitOpts{
+		AfterSeen: &id1, // 同步堆叠：完整段 B+A
+		LineIDs:   []model.ID{id3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantFull := []string{"B", "A1", "A2"}
+	for _, who := range []string{"甲", "乙", "观察者"} {
+		got, err = d.InsertBelief(who, anchor, model.ActionInsert)
+		if err != nil || !slices.Equal(got, wantFull) {
+			t.Fatalf("%s 完整段: %v %+v", who, err, got)
+		}
+	}
+
+	candID := model.NewID()
+	d.disputes[candID] = &model.Dispute{
+		ID: candID, RealLine: anchor, Action: model.ActionInsert, Person: "甲", Content: []string{"候选段"},
+	}
+	got, err = d.InsertBelief("甲", anchor, model.ActionInsert)
+	if err != nil || len(got) != 1 || got[0] != "候选段" {
+		t.Fatalf("已登记候选优先: %v %+v", err, got)
+	}
+
+	d2 := New("t")
+	head := view(t, d2).Lines[0].ID
+	beforeID := model.NewID()
+	if err := d2.SubmitWith("甲", head, model.ActionInsertBefore, []string{"X"}, SubmitOpts{
+		BeforeSeen: &model.ID{},
+		LineIDs:    []model.ID{beforeID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d2.InsertBelief("甲", head, model.ActionInsertBefore)
+	if err != nil || len(got) != 1 || got[0] != "X" {
+		t.Fatalf("前插: %v %+v", err, got)
+	}
+	got, err = d2.InsertBelief("甲", head, model.ActionInsert)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("反方向应空: %v %+v", err, got)
+	}
+	if _, err := d.InsertBelief("甲", model.NewID(), model.ActionInsert); err != ErrLine {
+		t.Fatalf("缺行: %v", err)
+	}
+	if _, err := d.InsertBelief("甲", anchor, model.ActionEdit); err != ErrAction {
+		t.Fatalf("非插入: %v", err)
+	}
+}
+
+func TestInsertBeliefAfterStackedCAAndObserver(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: &tail,
+		LineIDs:   []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.InsertBelief("观察者", anchor, model.ActionInsert)
+	if err != nil || !slices.Equal(got, []string{"A"}) {
+		t.Fatalf("仅已同步 A 的观察者: %v %+v", err, got)
+	}
+	cID := model.NewID()
+	if err := d.SubmitWith("丙", anchor, model.ActionInsert, []string{"C"}, SubmitOpts{
+		AfterSeen: &aID,
+		LineIDs:   []model.ID{cID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantCA := []string{"C", "A"}
+	for _, who := range []string{"丙", "甲", "观察者"} {
+		got, err = d.InsertBelief(who, anchor, model.ActionInsert)
+		if err != nil || !slices.Equal(got, wantCA) {
+			t.Fatalf("%s 应为 C+A: %v %+v", who, err, got)
+		}
+	}
+
+	dDing := New("t")
+	if err := dDing.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	vd := view(t, dDing)
+	a2, t2 := vd.Lines[0].ID, vd.Lines[1].ID
+	if err := dDing.SubmitWith("丁", a2, model.ActionInsert, []string{"D"}, SubmitOpts{
+		AfterSeen: &t2,
+		LineIDs:   []model.ID{model.NewID()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = dDing.InsertBelief("丁", a2, model.ActionInsert)
+	if err != nil || !slices.Equal(got, []string{"D"}) {
+		t.Fatalf("丁未同步只见 D: %v %+v", err, got)
+	}
+}
+
+func TestInsertBeliefBeforeStackedSymmetric(t *testing.T) {
+	d := New("t")
+	head := view(t, d).Lines[0].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", head, model.ActionInsertBefore, []string{"A"}, SubmitOpts{
+		BeforeSeen: &model.ID{},
+		LineIDs:    []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.InsertBelief("观察者", head, model.ActionInsertBefore)
+	if err != nil || !slices.Equal(got, []string{"A"}) {
+		t.Fatalf("前插观察者 A: %v %+v", err, got)
+	}
+	cID := model.NewID()
+	if err := d.SubmitWith("丙", head, model.ActionInsertBefore, []string{"C"}, SubmitOpts{
+		BeforeSeen: &aID, // 同步堆叠：新段更靠近锚 → 阅读序 A,C
+		LineIDs:    []model.ID{cID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantAC := []string{"A", "C"}
+	for _, who := range []string{"丙", "甲", "观察者"} {
+		got, err = d.InsertBelief(who, head, model.ActionInsertBefore)
+		if err != nil || !slices.Equal(got, wantAC) {
+			t.Fatalf("%s 前插完整段 A+C: %v %+v", who, err, got)
+		}
+	}
+	got, err = d.InsertBelief("丙", head, model.ActionInsert)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("反方向应空: %v %+v", err, got)
+	}
+}
+
+func TestReceiveForeignEditClaim(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"本地"}); err != nil {
+		t.Fatal(err)
+	}
+	before := view(t, d)
+	if before.Lines[0].Content != "本地" || len(before.Disputes) != 0 {
+		t.Fatalf("接收前应只有正文: %+v", before)
+	}
+	liveBefore := d.live[claimKey{line, model.ActionEdit}]
+	histBefore := len(d.insertHistory)
+
+	foreignID, ownID := model.NewID(), model.NewID()
+	foreign := model.Dispute{
+		ID:       foreignID,
+		RealLine: line,
+		Action:   model.ActionEdit,
+		Person:   "乙",
+		Content:  []string{"远端"},
+	}
+	if err := d.ReceiveForeignEditClaim("甲", foreign, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if after.Lines[0].Content != "本地" || after.Lines[0].Prev != before.Lines[0].Prev || after.Lines[0].Next != before.Lines[0].Next {
+		t.Fatalf("正式正文与链应不变: %+v", after.Lines[0])
+	}
+	if len(after.Disputes) != 2 {
+		t.Fatalf("本人+外来各一份: %+v", after.Disputes)
+	}
+	jia, ok1 := byPerson(after, "甲")
+	yi, ok2 := byPerson(after, "乙")
+	if !ok1 || !ok2 || jia.ID != ownID || yi.ID != foreignID {
+		t.Fatalf("稳定 ID: 甲=%+v 乙=%+v", jia, yi)
+	}
+	if len(jia.Content) != 1 || jia.Content[0] != "本地" || len(yi.Content) != 1 || yi.Content[0] != "远端" {
+		t.Fatalf("候选内容: 甲=%+v 乙=%+v", jia.Content, yi.Content)
+	}
+	if d.live[claimKey{line, model.ActionEdit}] != liveBefore || len(d.insertHistory) != histBefore {
+		t.Fatal("不得动 live / insertHistory")
+	}
+
+	foreign.Content = []string{"远端改"}
+	if err := d.ReceiveForeignEditClaim("甲", foreign, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	again := view(t, d)
+	if len(again.Disputes) != 2 {
+		t.Fatalf("重复 ID 仍各一份: %+v", again.Disputes)
+	}
+	yi, _ = byPerson(again, "乙")
+	jia, _ = byPerson(again, "甲")
+	if yi.Content[0] != "远端改" || jia.ID != ownID || jia.Content[0] != "本地" {
+		t.Fatalf("更新外来、本人 ID/内容保持: 甲=%+v 乙=%+v", jia, yi)
+	}
+
+	snap := len(d.disputes)
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionEdit, Person: "甲", Content: []string{"自CC"},
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.disputes) != snap {
+		t.Fatal("本人 CC 应忽略")
+	}
+}
+
+func TestReceiveForeignEditClaimKeepsLiveMultiline(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	tail := model.NewID()
+	if err := d.SubmitWith("甲", line, model.ActionEdit, []string{"hello", "world"}, SubmitOpts{LineIDs: []model.ID{tail}}); err != nil {
+		t.Fatal(err)
+	}
+	before := view(t, d)
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"other"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if len(after.Lines) != len(before.Lines) {
+		t.Fatalf("行数不变: before=%d after=%d", len(before.Lines), len(after.Lines))
+	}
+	for i := range before.Lines {
+		if after.Lines[i].Content != before.Lines[i].Content || after.Lines[i].Prev != before.Lines[i].Prev || after.Lines[i].Next != before.Lines[i].Next {
+			t.Fatalf("链不变 [%d]: %+v vs %+v", i, before.Lines[i], after.Lines[i])
+		}
+	}
+	jia, _ := byPerson(after, "甲")
+	if len(jia.Content) != 2 || jia.Content[0] != "hello" || jia.Content[1] != "world" {
+		t.Fatalf("本人候选应保留 live 整段: %+v", jia.Content)
+	}
+}
+
+func TestReceiveForeignEditClaimRejectsBadInput(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	ownID := model.NewID()
+	bad := []model.Dispute{
+		{ID: model.NewID(), RealLine: line, Action: model.ActionInsert, Person: "乙", Content: []string{"y"}},
+		{ID: model.ID{}, RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"y"}},
+		{ID: model.NewID(), RealLine: model.ID{}, Action: model.ActionEdit, Person: "乙", Content: []string{"y"}},
+		{ID: model.NewID(), RealLine: model.NewID(), Action: model.ActionEdit, Person: "乙", Content: []string{"y"}},
+	}
+	for i, foreign := range bad {
+		if err := d.ReceiveForeignEditClaim("甲", foreign, ownID); err == nil {
+			t.Fatalf("坏输入[%d]应失败", i)
+		}
+		if len(d.disputes) != 0 {
+			t.Fatalf("坏输入[%d]不得留半成品: %+v", i, d.disputes)
+		}
+	}
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"y"},
+	}, model.ID{}); err == nil || len(d.disputes) != 0 {
+		t.Fatalf("ownID 为零不得半成品: err=%v disputes=%d", err, len(d.disputes))
+	}
+	foreignID := model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"y"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "丙", Content: []string{"z"},
+	}, model.NewID()); err == nil {
+		t.Fatal("同 ID 换人应拒绝")
+	}
+	if len(view(t, d).Disputes) != 2 {
+		t.Fatalf("换人拒绝后份数不变: %+v", view(t, d).Disputes)
+	}
+	otherLine := model.NewID()
+	d.lines[otherLine] = &model.Line{ID: otherLine}
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: otherLine, Action: model.ActionEdit, Person: "乙", Content: []string{"z"},
+	}, model.NewID()); err == nil {
+		t.Fatal("同 ID 换行应拒绝")
+	}
+}
+
+func TestReceiveForeignDeleteClaim(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"保留"}); err != nil {
+		t.Fatal(err)
+	}
+	before := view(t, d)
+	liveBefore := d.live[claimKey{line, model.ActionEdit}]
+	histBefore := len(d.insertHistory)
+
+	foreignID, ownID := model.NewID(), model.NewID()
+	foreign := model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}
+	if err := d.ReceiveForeignDeleteClaim("甲", foreign, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if after.Lines[0].Content != "保留" || after.Lines[0].Prev != before.Lines[0].Prev || after.Lines[0].Next != before.Lines[0].Next {
+		t.Fatalf("正式链原样: %+v", after.Lines[0])
+	}
+	if len(after.Disputes) != 2 {
+		t.Fatalf("本人 Edit + 外来 Delete: %+v", after.Disputes)
+	}
+	jia, ok1 := byPerson(after, "甲")
+	yi, ok2 := byPerson(after, "乙")
+	if !ok1 || !ok2 || jia.ID != ownID || yi.ID != foreignID {
+		t.Fatalf("稳定 ID: 甲=%+v 乙=%+v", jia, yi)
+	}
+	if jia.Action != model.ActionEdit || len(jia.Content) != 1 || jia.Content[0] != "保留" {
+		t.Fatalf("本人保留行: %+v", jia)
+	}
+	if yi.Action != model.ActionDelete || len(yi.Content) != 0 {
+		t.Fatalf("外来删这行: %+v", yi)
+	}
+	if d.live[claimKey{line, model.ActionEdit}] != liveBefore || len(d.insertHistory) != histBefore {
+		t.Fatal("不得动 live / insertHistory")
+	}
+
+	// 幂等：同 foreign ID 再来仍各一份
+	if err := d.ReceiveForeignDeleteClaim("甲", foreign, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	again := view(t, d)
+	if len(again.Disputes) != 2 {
+		t.Fatalf("重复仍各一份: %+v", again.Disputes)
+	}
+	jia, _ = byPerson(again, "甲")
+	yi, _ = byPerson(again, "乙")
+	if jia.ID != ownID || yi.ID != foreignID || yi.Action != model.ActionDelete {
+		t.Fatalf("幂等保 ID/动作: 甲=%+v 乙=%+v", jia, yi)
+	}
+
+	snap := len(d.disputes)
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionDelete, Person: "甲", Content: nil,
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.disputes) != snap {
+		t.Fatal("本人 CC 应忽略")
+	}
+}
+
+func TestReceiveForeignDeleteClaimKeepsOwnEditID(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"本地"}); err != nil {
+		t.Fatal(err)
+	}
+	editOwnID, editForeignID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: editForeignID, RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"远端"},
+	}, editOwnID); err != nil {
+		t.Fatal(err)
+	}
+	delForeignID := model.NewID()
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: delForeignID, RealLine: line, Action: model.ActionDelete, Person: "丙", Content: nil,
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	if len(v.Disputes) != 3 {
+		t.Fatalf("甲Edit+乙Edit+丙Delete: %+v", v.Disputes)
+	}
+	jia, _ := byPerson(v, "甲")
+	if jia.ID != editOwnID || jia.Action != model.ActionEdit || jia.Content[0] != "本地" {
+		t.Fatalf("本人 Edit 不漂: %+v", jia)
+	}
+}
+
+func TestReceiveForeignDeleteClaimKeepsOwnDeleteID(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	line := view(t, d).Lines[1].ID
+	ownDelID := model.NewID()
+	if err := d.StoreExplicitClaim(model.Dispute{
+		ID: ownDelID, RealLine: line, Action: model.ActionDelete, Person: "甲", Content: nil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID := model.NewID()
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	jia, _ := byPerson(v, "甲")
+	yi, _ := byPerson(v, "乙")
+	if jia.ID != ownDelID || jia.Action != model.ActionDelete {
+		t.Fatalf("本人 Delete 不漂: %+v", jia)
+	}
+	if yi.ID != foreignID || yi.Action != model.ActionDelete {
+		t.Fatalf("外来 Delete: %+v", yi)
+	}
+	if len(v.Disputes) != 2 {
+		t.Fatalf("恰两份: %+v", v.Disputes)
+	}
+}
+
+func TestReceiveForeignBodyClaimActionSwitchSameID(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"行"}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙",
+		Content: []string{"改"}, Followers: []string{"丙"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "乙",
+		Content: nil, Followers: nil,
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	if len(v.Disputes) != 2 {
+		t.Fatalf("切换后仍两份: %+v", v.Disputes)
+	}
+	jia, _ := byPerson(v, "甲")
+	yi, _ := byPerson(v, "乙")
+	if jia.ID != ownID || jia.Action != model.ActionEdit {
+		t.Fatalf("本人不变: %+v", jia)
+	}
+	if yi.ID != foreignID || yi.Action != model.ActionDelete || len(yi.Followers) != 1 || yi.Followers[0] != "丙" {
+		t.Fatalf("同 ID Edit→Delete 保 Followers: %+v", yi)
+	}
+
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙",
+		Content: []string{"又改"}, Followers: []string{},
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	yi, _ = byPerson(view(t, d), "乙")
+	if yi.ID != foreignID || yi.Action != model.ActionEdit || yi.Content[0] != "又改" || yi.Followers[0] != "丙" {
+		t.Fatalf("同 ID Delete→Edit: %+v", yi)
+	}
+}
+
+func TestReceiveForeignEditClaimKeepsFollowMetaOnContentCC(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"本地"}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙",
+		Content: []string{"远端"}, Followers: []string{"旁观"},
+		Pending: []model.PendingConfirm{{From: "丙", To: "乙", ClientTs: 9}},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.RequestFollow("甲", foreignID, 1)
+	if err != nil || out.Status != FollowPending {
+		t.Fatalf("甲追随乙: %+v err=%v", out, err)
+	}
+	yi, _ := byPerson(view(t, d), "乙")
+	if len(yi.Followers) != 1 || yi.Followers[0] != "旁观" || len(yi.Pending) != 2 {
+		t.Fatalf("初登记 Followers+Pending: %+v", yi)
+	}
+
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙",
+		Content: []string{"远端改"}, Followers: nil, Pending: nil,
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	yi, _ = byPerson(view(t, d), "乙")
+	if yi.Content[0] != "远端改" {
+		t.Fatalf("应更新正文: %+v", yi)
+	}
+	if len(yi.Followers) != 1 || yi.Followers[0] != "旁观" {
+		t.Fatalf("空 metadata 不得擦 Followers: %+v", yi)
+	}
+	if len(yi.Pending) != 2 {
+		t.Fatalf("空 metadata 不得擦 Pending: %+v", yi.Pending)
+	}
+
+	if err := d.ReceiveForeignEditClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionEdit, Person: "乙",
+		Content: []string{"再改"}, Followers: []string{}, Pending: []model.PendingConfirm{},
+	}, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	yi, _ = byPerson(view(t, d), "乙")
+	if len(yi.Followers) != 1 || yi.Followers[0] != "旁观" || len(yi.Pending) != 2 {
+		t.Fatalf("显式空 metadata 仍保追随: %+v", yi)
+	}
+}
+
+func TestReceiveForeignDeleteClaimRequestFollowPending(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.RequestFollow("甲", foreignID, 1)
+	if err != nil || out.Status != FollowPending || out.DisputeID != foreignID {
+		t.Fatalf("追随删除候选进 Pending: out=%+v err=%v", out, err)
+	}
+}
+
+func TestReceiveForeignDeleteClaimRejectsBadInput(t *testing.T) {
+	d := New("t")
+	line := view(t, d).Lines[0].ID
+	if err := d.Submit("甲", line, model.ActionEdit, []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	ownID := model.NewID()
+	bad := []model.Dispute{
+		{ID: model.NewID(), RealLine: line, Action: model.ActionEdit, Person: "乙", Content: []string{"y"}},
+		{ID: model.ID{}, RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil},
+		{ID: model.NewID(), RealLine: model.ID{}, Action: model.ActionDelete, Person: "乙", Content: nil},
+		{ID: model.NewID(), RealLine: model.NewID(), Action: model.ActionDelete, Person: "乙", Content: nil},
+		{ID: model.NewID(), RealLine: line, Action: model.ActionDelete, Person: "乙", Content: []string{"非空"}},
+	}
+	for i, foreign := range bad {
+		if err := d.ReceiveForeignDeleteClaim("甲", foreign, ownID); err == nil {
+			t.Fatalf("坏输入[%d]应失败", i)
+		}
+		if len(d.disputes) != 0 {
+			t.Fatalf("坏输入[%d]零突变: %+v", i, d.disputes)
+		}
+	}
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}, model.ID{}); err == nil || len(d.disputes) != 0 {
+		t.Fatalf("ownID 为零不得半成品: err=%v disputes=%d", err, len(d.disputes))
+	}
+
+	foreignID := model.NewID()
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	// 同人同槽不同 ID
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: line, Action: model.ActionDelete, Person: "乙", Content: nil,
+	}, model.NewID()); err == nil {
+		t.Fatal("同人同槽双候选应拒")
+	}
+	if len(view(t, d).Disputes) != 2 {
+		t.Fatalf("拒绝后份数不变: %+v", view(t, d).Disputes)
+	}
+	if err := d.ReceiveForeignDeleteClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: line, Action: model.ActionDelete, Person: "丙", Content: nil,
+	}, model.NewID()); err == nil {
+		t.Fatal("同 ID 换人应拒绝")
+	}
+}
+
+func TestReceiveForeignInsertClaimStackedAfter(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	before := view(t, d)
+	anchor, tail := before.Lines[0].ID, before.Lines[1].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: idPtr(tail), LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cID := model.NewID()
+	if err := d.SubmitWith("丙", anchor, model.ActionInsert, []string{"C"}, SubmitOpts{
+		AfterSeen: idPtr(aID), LineIDs: []model.ID{cID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	foreign := model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁",
+		Content: []string{"D"}, Followers: []string{"旁观"}, BaseIDs: []model.ID{model.NewID()},
+	}
+	if err := d.ReceiveForeignInsertClaim("丙", foreign, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if len(after.Lines) != 2 || after.Lines[0].ID != anchor || after.Lines[0].Next != tail || after.Lines[1].ID != tail {
+		t.Fatalf("链只留锚+原后继: %+v", after.Lines)
+	}
+	if len(after.Disputes) != 3 {
+		t.Fatalf("甲/丙/丁 三份: %+v", after.Disputes)
+	}
+	jia, _ := byPerson(after, "甲")
+	bing, _ := byPerson(after, "丙")
+	ding, _ := byPerson(after, "丁")
+	if !slices.Equal(jia.Content, []string{"A"}) {
+		t.Fatalf("甲候选 A: %+v", jia.Content)
+	}
+	if !slices.Equal(bing.Content, []string{"C", "A"}) || bing.ID != ownID {
+		t.Fatalf("丙=C+A ownID: %+v", bing)
+	}
+	if !slices.Equal(ding.Content, []string{"D"}) || ding.ID != foreignID {
+		t.Fatalf("丁=D foreign.ID: %+v", ding)
+	}
+	if len(ding.Followers) != 1 || ding.Followers[0] != "旁观" || len(ding.BaseIDs) != 1 {
+		t.Fatalf("外来 Followers/BaseIDs 应复制: %+v", ding)
+	}
+	if d.live[claimKey{anchor, model.ActionInsert}] != nil || len(d.insertHistory[claimKey{anchor, model.ActionInsert}]) != 0 {
+		t.Fatal("提升后本锚后插 live/history 应空")
+	}
+}
+
+func TestReceiveForeignInsertClaimStackedBefore(t *testing.T) {
+	d := New("t")
+	head := view(t, d).Lines[0].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", head, model.ActionInsertBefore, []string{"A"}, SubmitOpts{
+		BeforeSeen: &model.ID{}, LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cID := model.NewID()
+	if err := d.SubmitWith("丙", head, model.ActionInsertBefore, []string{"C"}, SubmitOpts{
+		BeforeSeen: idPtr(aID), LineIDs: []model.ID{cID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignInsertClaim("丙", model.Dispute{
+		ID: foreignID, RealLine: head, Action: model.ActionInsertBefore, Person: "丁", Content: []string{"D"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if len(after.Lines) != 1 || after.Lines[0].ID != head || !after.Lines[0].Prev.IsZero() {
+		t.Fatalf("前插提升后只留锚: %+v", after.Lines)
+	}
+	jia, _ := byPerson(after, "甲")
+	bing, _ := byPerson(after, "丙")
+	ding, _ := byPerson(after, "丁")
+	if !slices.Equal(jia.Content, []string{"A"}) || !slices.Equal(bing.Content, []string{"A", "C"}) || bing.ID != ownID {
+		t.Fatalf("前插层叠 甲=A 丙=A+C: 甲=%+v 丙=%+v", jia, bing)
+	}
+	if ding.ID != foreignID || !slices.Equal(ding.Content, []string{"D"}) {
+		t.Fatalf("丁: %+v", ding)
+	}
+}
+
+func TestReceiveForeignInsertClaimObserverOwnIsIntegrated(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: idPtr(tail), LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignInsertClaim("观察者", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	obs, _ := byPerson(after, "观察者")
+	jia, _ := byPerson(after, "甲")
+	ding, _ := byPerson(after, "丁")
+	if obs.ID != ownID || !slices.Equal(obs.Content, []string{"A"}) {
+		t.Fatalf("本人没插但已整合 A: %+v", obs)
+	}
+	if !slices.Equal(jia.Content, []string{"A"}) || ding.ID != foreignID {
+		t.Fatalf("甲/丁: %+v %+v", jia, ding)
+	}
+}
+
+func TestReceiveForeignInsertClaimReplayAndRebind(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: idPtr(tail), LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignInsertClaim("丙", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	jia, _ := byPerson(view(t, d), "甲")
+	randomAID := jia.ID
+
+	foreign := model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D2"},
+	}
+	if err := d.ReceiveForeignInsertClaim("丙", foreign, model.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	again := view(t, d)
+	if len(again.Disputes) != 3 {
+		t.Fatalf("重放不增份: %+v", again.Disputes)
+	}
+	ding, _ := byPerson(again, "丁")
+	if ding.Content[0] != "D2" || ding.ID != foreignID {
+		t.Fatalf("按 ID 更新: %+v", ding)
+	}
+
+	stableAID := model.NewID()
+	if err := d.ReceiveForeignInsertClaim("丙", model.Dispute{
+		ID: stableAID, RealLine: anchor, Action: model.ActionInsert, Person: "甲", Content: []string{"A-stable"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	final := view(t, d)
+	if len(final.Disputes) != 3 {
+		t.Fatalf("甲重绑不增份: %+v", final.Disputes)
+	}
+	jia, _ = byPerson(final, "甲")
+	if jia.ID != stableAID || jia.ID == randomAID || !slices.Equal(jia.Content, []string{"A-stable"}) {
+		t.Fatalf("甲应重绑稳定 ID: old=%s got=%+v", randomAID.Hex(), jia)
+	}
+}
+
+func TestReceiveForeignInsertClaimPreservesOtherAnchor(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(3); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	a0, a1, a2 := v.Lines[0].ID, v.Lines[1].ID, v.Lines[2].ID
+	insID := model.NewID()
+	if err := d.SubmitWith("甲", a0, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: idPtr(a1), LineIDs: []model.ID{insID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Submit("乙", a2, model.ActionEdit, []string{"改尾"}); err != nil {
+		t.Fatal(err)
+	}
+	if d.live[claimKey{a2, model.ActionEdit}] == nil || d.live[claimKey{a2, model.ActionEdit}].spliced {
+		t.Fatal("前置：a2 应有未拼接 edit live")
+	}
+	beforeID := model.NewID()
+	if err := d.SubmitWith("戊", a1, model.ActionInsertBefore, []string{"前"}, SubmitOpts{
+		BeforeSeen: idPtr(insID), LineIDs: []model.ID{beforeID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d.live[claimKey{a1, model.ActionInsertBefore}] == nil {
+		t.Fatal("前置：a1 前插 live")
+	}
+	extraID := model.NewID()
+	d.disputes[extraID] = &model.Dispute{
+		ID: extraID, RealLine: a2, Action: model.ActionEdit, Person: "己",
+		Content: []string{"挂"}, Followers: []string{},
+	}
+	d.suspended[extraID] = true
+	d.pending = append(d.pending, followPend{from: "庚", to: "己", dispute: extraID, ts: 1})
+	pendN, susN := len(d.pending), len(d.suspended)
+
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: a0, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.live[claimKey{a2, model.ActionEdit}]; got == nil || got.person != "乙" || got.content[0] != "改尾" || got.spliced {
+		t.Fatalf("另一锚点未拼接 edit live 应保留: %+v", got)
+	}
+	if got := d.live[claimKey{a1, model.ActionInsertBefore}]; got == nil || got.person != "戊" {
+		t.Fatalf("反方向前插 live 应保留: %+v", got)
+	}
+	if len(d.pending) != pendN || len(d.suspended) != susN || !d.suspended[extraID] {
+		t.Fatalf("pending/suspended 应保留 pend=%d sus=%d", len(d.pending), len(d.suspended))
+	}
+	if d.disputes[extraID] == nil || d.disputes[extraID].Content[0] != "挂" {
+		t.Fatal("无关挂起争议应保留")
+	}
+}
+
+func TestReceiveForeignInsertClaimRejectZeroMutation(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	before := view(t, d)
+	anchor, tail := before.Lines[0].ID, before.Lines[1].ID
+	a1, a2 := model.NewID(), model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A1", "A2"}, SubmitOpts{
+		AfterSeen: idPtr(tail), LineIDs: []model.ID{a1, a2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Submit("乙", a2, model.ActionEdit, []string{"x", "y"}); err != nil {
+		t.Fatal(err)
+	}
+	snapView := view(t, d)
+	snapTexts := textsOf(snapView.Lines)
+	liveKeys := len(d.live)
+	histKeys := len(d.insertHistory)
+	dispN := len(d.disputes)
+	livePtr := d.live[claimKey{anchor, model.ActionInsert}]
+
+	err := d.ReceiveForeignInsertClaim("丙", model.Dispute{
+		ID: model.NewID(), RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, model.NewID())
+	if err != ErrPromoteUnsafe {
+		t.Fatalf("子多行粘贴应 ErrPromoteUnsafe: %v", err)
+	}
+	after := view(t, d)
+	if len(after.Lines) != len(snapView.Lines) || len(after.Disputes) != len(snapView.Disputes) {
+		t.Fatalf("View 零突变 lines/disputes")
+	}
+	if !slices.Equal(textsOf(after.Lines), snapTexts) {
+		t.Fatalf("正文零突变: before=%v after=%v", snapTexts, textsOf(after.Lines))
+	}
+	if len(d.live) != liveKeys || len(d.insertHistory) != histKeys || len(d.disputes) != dispN {
+		t.Fatalf("内部 map 零突变 live=%d hist=%d disp=%d", len(d.live), len(d.insertHistory), len(d.disputes))
+	}
+	if d.live[claimKey{anchor, model.ActionInsert}] != livePtr {
+		t.Fatal("本锚 live 指针应未替换")
+	}
+}
+
+func TestReceiveForeignInsertClaimRequestFollowStableID(t *testing.T) {
+	d := New("t")
+	if err := d.EnsureLines(2); err != nil {
+		t.Fatal(err)
+	}
+	v := view(t, d)
+	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: idPtr(tail), LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreignID, ownID := model.NewID(), model.NewID()
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁",
+		Content: []string{"D"}, Followers: []string{},
+	}, ownID); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.RequestFollow("甲", foreignID, 1)
+	if err != nil || out.DisputeID != foreignID {
+		t.Fatalf("RequestFollow foreign.ID: out=%+v err=%v", out, err)
+	}
+	out2, err := d.RequestFollow("丁", ownID, 2)
+	if err != nil || out2.DisputeID != ownID {
+		t.Fatalf("RequestFollow ownID: out=%+v err=%v", out2, err)
+	}
+}
+
+func TestReceiveForeignInsertClaimNoSegJustForeign(t *testing.T) {
+	d := New("t")
+	anchor := view(t, d).Lines[0].ID
+	beforeN := len(view(t, d).Lines)
+	foreignID := model.NewID()
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, model.ID{}); err != nil {
+		t.Fatal(err)
+	}
+	after := view(t, d)
+	if len(after.Lines) != beforeN {
+		t.Fatalf("无段不得加空白正式行: %d→%d", beforeN, len(after.Lines))
+	}
+	if len(after.Disputes) != 1 {
+		t.Fatalf("只登记 foreign: %+v", after.Disputes)
+	}
+	ding, _ := byPerson(after, "丁")
+	_, hasSelf := byPerson(after, "甲")
+	if ding.ID != foreignID || hasSelf {
+		t.Fatalf("无本人候选: %+v", after.Disputes)
+	}
+	snap := len(d.disputes)
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: anchor, Action: model.ActionInsert, Person: "甲", Content: []string{"自"},
+	}, model.NewID()); err != nil || len(d.disputes) != snap {
+		t.Fatal("本人 CC 忽略")
+	}
+}
+
+func TestReceiveForeignInsertClaimKeepsFollowMetaOnContentCC(t *testing.T) {
+	d := New("t")
+	anchor := view(t, d).Lines[0].ID
+	foreignID := model.NewID()
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁",
+		Content: []string{"D"}, Followers: []string{"旁观"},
+		Pending: []model.PendingConfirm{{From: "丙", To: "丁", ClientTs: 3}},
+	}, model.ID{}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := d.RequestFollow("甲", foreignID, 1)
+	if err != nil || out.Status != FollowPending {
+		t.Fatalf("甲追随丁: %+v err=%v", out, err)
+	}
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: foreignID, RealLine: anchor, Action: model.ActionInsert, Person: "丁",
+		Content: []string{"D2"}, Followers: nil, Pending: nil,
+	}, model.ID{}); err != nil {
+		t.Fatal(err)
+	}
+	ding, _ := byPerson(view(t, d), "丁")
+	if ding.Content[0] != "D2" || len(ding.Followers) != 1 || ding.Followers[0] != "旁观" || len(ding.Pending) != 2 {
+		t.Fatalf("Insert 同 ID 空 metadata 保追随: %+v", ding)
+	}
+}
+
+func TestReceiveForeignInsertClaimRejectsBadInput(t *testing.T) {
+	d := New("t")
+	anchor := view(t, d).Lines[0].ID
+	ownID := model.NewID()
+	bad := []model.Dispute{
+		{ID: model.NewID(), RealLine: anchor, Action: model.ActionEdit, Person: "乙", Content: []string{"y"}},
+		{ID: model.ID{}, RealLine: anchor, Action: model.ActionInsert, Person: "乙", Content: []string{"y"}},
+		{ID: model.NewID(), RealLine: model.ID{}, Action: model.ActionInsert, Person: "乙", Content: []string{"y"}},
+		{ID: model.NewID(), RealLine: model.NewID(), Action: model.ActionInsert, Person: "乙", Content: []string{"y"}},
+	}
+	for i, foreign := range bad {
+		if err := d.ReceiveForeignInsertClaim("甲", foreign, ownID); err == nil {
+			t.Fatalf("坏输入[%d]应失败", i)
+		}
+		if len(d.disputes) != 0 {
+			t.Fatalf("坏输入[%d]不得半成品", i)
+		}
+	}
+	aID := model.NewID()
+	if err := d.SubmitWith("甲", anchor, model.ActionInsert, []string{"A"}, SubmitOpts{
+		AfterSeen: &model.ID{}, LineIDs: []model.ID{aID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ReceiveForeignInsertClaim("甲", model.Dispute{
+		ID: model.NewID(), RealLine: anchor, Action: model.ActionInsert, Person: "丁", Content: []string{"D"},
+	}, model.ID{}); err == nil {
+		t.Fatal("有段时 ownID 为零应拒绝")
+	}
+	if len(view(t, d).Disputes) != 0 || d.live[claimKey{anchor, model.ActionInsert}] == nil {
+		t.Fatal("ownID 为零拒绝后正式段应仍在")
 	}
 }

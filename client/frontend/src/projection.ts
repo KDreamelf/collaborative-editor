@@ -25,6 +25,26 @@ export function textChange(before: string, after: string): { from: number; to: n
   return { from, to, insert: after.slice(from, end) }
 }
 
+/** 空行 Enter 行尾优先（after）；非空行首 before、行尾 after。 */
+export function enterAnchorsBefore(lineEmpty: boolean, atLineStart: boolean): boolean {
+  if (lineEmpty) return false
+  return atLineStart
+}
+
+/**
+ * 初次行边插入的结构光标目标。
+ * before：CM 原生把光标落在下方原文字行（from+1），snapshot 后仍锚该正式行。
+ * after：锚到新空行。
+ */
+export function insertEdgeCaretTarget(before: boolean, formalContent: string): {
+  part: number
+  insert: boolean
+  text: string
+} {
+  if (before) return { part: 0, insert: false, text: formalContent }
+  return { part: 0, insert: true, text: '' }
+}
+
 /** 使用原生操作坐标；相邻空行或重复文字不能靠文本差异猜锚点。 */
 export function changedRange(changes: ChangeSet, newDoc: Text): { from: number; to: number; insert: string } {
   let from = Infinity

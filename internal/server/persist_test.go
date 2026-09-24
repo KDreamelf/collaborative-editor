@@ -16,13 +16,14 @@ import (
 )
 
 type fakeStore struct {
-	mu      sync.Mutex
-	ids     []string
-	docs    map[string]*document.Doc
-	listErr error
-	loadErr error
-	saveErr error
-	saves   int
+	mu         sync.Mutex
+	ids        []string
+	docs       map[string]*document.Doc
+	listErr    error
+	loadErr    error
+	saveErr    error
+	failAtSave int // >0 时第 N 次 save 返回错误（1-based）
+	saves      int
 }
 
 func (f *fakeStore) listIDs(ctx context.Context) ([]string, error) {
@@ -53,21 +54,23 @@ func (f *fakeStore) save(ctx context.Context, v document.View) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.saves++
+	if f.failAtSave > 0 && f.saves == f.failAtSave {
+		if f.saveErr != nil {
+			return f.saveErr
+		}
+		return errors.New("forced save fail")
+	}
 	if f.saveErr != nil {
 		return f.saveErr
 	}
 	return nil
 }
 
-func TestConnectMongoKeepsClientWhenPingFails(t *testing.T) {
-	// 未监听端口：Connect 仍成功，Ping 失败；修复前会 Disconnect 并返回 nil。
+func TestConnectMongoNilWhenPingFails(t *testing.T) {
+	// 未监听端口：Connect 可能成功，Ping 失败则 Disconnect 并返回 nil。
 	store := connectMongo("mongodb://127.0.0.1:1", "editor_persist_test")
-	if store == nil {
-		t.Fatal("Ping 失败仍应保留 mongo client，供后续重连读写")
-	}
-	defer func() { _ = store.client.Disconnect(context.Background()) }()
-	if store.client == nil || store.db == nil {
-		t.Fatal("client/db 不应为空")
+	if store != nil {
+		t.Fatal("Ping 失败应返回 nil，不得保留不可用 client")
 	}
 }
 

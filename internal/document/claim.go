@@ -1288,6 +1288,342 @@ func (d *Doc) upsert(person string, line model.ID, action string, content []stri
 	return item
 }
 
+// EditBelief 只读：该人对该行的 ActionEdit 主张正文。
+// 优先已登记候选，其次同人 live.content，最后正式行 Content。返回切片副本。
+func (d *Doc) EditBelief(person string, line model.ID) ([]string, error) {
+	ln := d.lines[line]
+	if ln == nil {
+		return nil, ErrLine
+	}
+	if item := d.byPerson(line, model.ActionEdit, person); item != nil {
+		return append([]string(nil), item.Content...), nil
+	}
+	if live := d.live[claimKey{line, model.ActionEdit}]; live != nil && live.person == person {
+		return append([]string(nil), live.content...), nil
+	}
+	return []string{ln.Content}, nil
+}
+
+// InsertBelief 只读：本端已整合的该锚点同方向完整插入段。
+// 优先本人 Dispute 候选；否则 collectAnchorInserts 按阅读序组合仍在链上的段
+//（后插新→旧，前插旧→新）。完全无插入返回空。不含锚点正文、不含反方向/他锚点段。
+// 嵌套布局无法无损表达时返回明确错误，不改 Doc，不假造只含最新段的主张。
+func (d *Doc) InsertBelief(person string, line model.ID, action string) ([]string, error) {
+	if !model.IsInsertAction(action) {
+		return nil, ErrAction
+	}
+	if d.lines[line] == nil {
+		return nil, ErrLine
+	}
+	if item := d.byPerson(line, action, person); item != nil {
+		return append([]string(nil), item.Content...), nil
+	}
+	key := claimKey{line, action}
+	segs := d.collectAnchorInserts(key)
+	if len(segs) == 0 {
+		return []string{}, nil
+	}
+	before := key.action == model.ActionInsertBefore
+	var out []string
+	for i := 0; i < len(segs); i++ {
+		idx := i
+		if !before {
+			idx = len(segs) - 1 - i
+		}
+		seg := segs[idx]
+		if len(seg.ids) == 0 {
+			return nil, ErrPromoteUnsafe
+		}
+		head := d.lines[seg.ids[0]]
+		if head == nil || head.InsertOrigin == nil ||
+			head.InsertOrigin.Person != seg.person || head.InsertOrigin.Anchor != key.line ||
+			model.InsertAction(head.InsertOrigin.Action) != key.action {
+			return nil, ErrPromoteUnsafe
+		}
+		if err := d.checkSegmentUnlink(key.line, seg, key.action); err != nil {
+			return nil, ErrPromoteUnsafe
+		}
+		if _, err := d.planPromote(key, seg); err != nil {
+			return nil, err
+		}
+		for _, id := range seg.ids {
+			ln := d.lines[id]
+			if ln == nil {
+				return nil, ErrBroken
+			}
+			out = append(out, ln.Content)
+		}
+	}
+	return out, nil
+}
+
+// ReceiveForeignEditClaim 登记远端 ActionEdit 主张：按 foreign.ID 幂等 upsert，
+// 若本端该 body 槽尚无本人候选则以 ownID 建 ActionEdit。不改正式链 / live / insertHistory，不 tryResolve。
+func (d *Doc) ReceiveForeignEditClaim(self string, foreign model.Dispute, ownID model.ID) error {
+	return d.receiveForeignBodyClaim(self, foreign, ownID, model.ActionEdit)
+}
+
+// ReceiveForeignDeleteClaim 仅在收到他人 ActionDelete 显式 CC 时登记：按 foreign.ID 幂等 upsert，
+// 同槽无本人候选则以 ownID 建 ActionEdit 保留行（EditBelief）。正式链 / live 不变，不 tryResolve。
+func (d *Doc) ReceiveForeignDeleteClaim(self string, foreign model.Dispute, ownID model.ID) error {
+	return d.receiveForeignBodyClaim(self, foreign, ownID, model.ActionDelete)
+}
+
+// receiveForeignBodyClaim：Edit/Delete 同 body 槽共用。同 foreign.ID 允许 Edit↔Delete 切换并保留 Followers；
+// 同人同槽不同 ID 拒双候选。失败零突变。
+func (d *Doc) receiveForeignBodyClaim(self string, foreign model.Dispute, ownID model.ID, action string) error {
+	if foreign.Action != action {
+		return ErrAction
+	}
+	if foreign.Person == self {
+		return nil
+	}
+	if foreign.ID.IsZero() || foreign.RealLine.IsZero() {
+		return ErrBroken
+	}
+	if d.lines[foreign.RealLine] == nil {
+		return ErrLine
+	}
+	if action == model.ActionDelete && len(foreign.Content) != 0 {
+		return ErrBroken
+	}
+	if action != model.ActionEdit && action != model.ActionDelete {
+		return ErrAction
+	}
+
+	existing := d.disputes[foreign.ID]
+	if existing != nil {
+		if existing.Person != foreign.Person || existing.RealLine != foreign.RealLine {
+			return ErrBroken
+		}
+		if !lineBodyAction(existing.Action) {
+			return ErrBroken
+		}
+	} else if other := d.byPerson(foreign.RealLine, action, foreign.Person); other != nil {
+		return ErrBroken
+	}
+
+	own := d.byPerson(foreign.RealLine, action, self)
+	needOwn := own == nil
+	var ownContent []string
+	if needOwn {
+		if ownID.IsZero() || ownID == foreign.ID {
+			return ErrBroken
+		}
+		if d.disputes[ownID] != nil {
+			return ErrBroken
+		}
+		var err error
+		ownContent, err = d.EditBelief(self, foreign.RealLine)
+		if err != nil {
+			return err
+		}
+	}
+
+	content := append([]string(nil), foreign.Content...)
+	baseIDs := append([]model.ID{}, foreign.BaseIDs...)
+	if existing != nil {
+		// 同 ID 内容 CC：保留已有 Followers 与 d.pending。
+		existing.Content = content
+		existing.BaseIDs = baseIDs
+		existing.Action = action
+		existing.Pending = nil
+	} else {
+		d.disputes[foreign.ID] = &model.Dispute{
+			ID:        foreign.ID,
+			RealLine:  foreign.RealLine,
+			Action:    action,
+			Person:    foreign.Person,
+			Content:   content,
+			BaseIDs:   baseIDs,
+			Followers: d.seedFollowMeta(foreign.ID, foreign.Followers, foreign.Pending),
+		}
+	}
+	if !needOwn {
+		return nil
+	}
+	d.disputes[ownID] = &model.Dispute{
+		ID:        ownID,
+		RealLine:  foreign.RealLine,
+		Action:    model.ActionEdit,
+		Person:    self,
+		Content:   ownContent,
+		Followers: []string{},
+	}
+	return nil
+}
+
+// ReceiveForeignInsertClaim 收到外来插入主张包才进争议：有同锚同方向正式段则提升为层叠候选并登记外来；
+// 无段只登记 foreign（不凭空加空白正式行）。失败在克隆上发生，原 Doc 零突变。
+func (d *Doc) ReceiveForeignInsertClaim(self string, foreign model.Dispute, ownID model.ID) error {
+	if !model.IsInsertAction(foreign.Action) {
+		return ErrAction
+	}
+	action := model.InsertAction(foreign.Action)
+	if foreign.Person == self {
+		return nil
+	}
+	if foreign.ID.IsZero() || foreign.RealLine.IsZero() {
+		return ErrBroken
+	}
+	line := foreign.RealLine
+	if d.lines[line] == nil {
+		return ErrLine
+	}
+	if existing := d.disputes[foreign.ID]; existing != nil {
+		if existing.Person != foreign.Person || existing.RealLine != line {
+			return ErrBroken
+		}
+	}
+	if ownID == foreign.ID {
+		return ErrBroken
+	}
+	if hit := d.disputes[ownID]; hit != nil {
+		if hit.Person != self || hit.RealLine != line || model.InsertAction(hit.Action) != action {
+			return ErrBroken
+		}
+	}
+
+	key := claimKey{line, action}
+	segs := d.collectAnchorInserts(key)
+	var belief []string
+	if len(segs) > 0 {
+		if ownID.IsZero() {
+			return ErrBroken
+		}
+		var err error
+		belief, err = d.InsertBelief(self, line, action)
+		if err != nil {
+			return err
+		}
+		for _, seg := range segs {
+			plans, err := d.planPromote(key, seg)
+			if err != nil {
+				return err
+			}
+			if len(segs) > 1 && len(plans) > 0 {
+				return ErrPromoteUnsafe
+			}
+		}
+	}
+
+	working := d.cloneDoc()
+	if err := working.applyForeignInsertClaim(self, foreign, ownID, key, segs, belief); err != nil {
+		return err
+	}
+	if _, err := working.View(); err != nil {
+		return err
+	}
+	*d = *working
+	return nil
+}
+
+func (d *Doc) applyForeignInsertClaim(self string, foreign model.Dispute, ownID model.ID, key claimKey, segs []*liveClaim, belief []string) error {
+	action := key.action
+	line := key.line
+	content := append([]string(nil), foreign.Content...)
+	baseIDs := append([]model.ID{}, foreign.BaseIDs...)
+	preexisting := d.disputes[foreign.ID]
+
+	if len(segs) > 0 {
+		// 克隆上的段指针来自 cloneLive，按原 ids 重新收集。
+		segs = d.collectAnchorInserts(key)
+		var err error
+		if len(segs) == 1 {
+			err = d.openInsertDispute(key, segs[0], foreign.Person, content)
+		} else {
+			err = d.openStackedInsertDispute(key, segs, foreign.Person, content)
+		}
+		if err != nil {
+			return err
+		}
+		foreignItem := d.byPerson(line, action, foreign.Person)
+		if foreignItem == nil {
+			return ErrBroken
+		}
+		if err := d.rebindDisputeID(foreignItem, foreign.ID); err != nil {
+			return err
+		}
+		foreignItem.Content = content
+		foreignItem.BaseIDs = baseIDs
+		foreignItem.Pending = nil
+		if preexisting == nil {
+			foreignItem.Followers = d.seedFollowMeta(foreign.ID, foreign.Followers, foreign.Pending)
+		}
+
+		own := d.byPerson(line, action, self)
+		if own == nil {
+			d.disputes[ownID] = &model.Dispute{
+				ID:        ownID,
+				RealLine:  line,
+				Action:    action,
+				Person:    self,
+				Content:   append([]string(nil), belief...),
+				Followers: []string{},
+			}
+		} else if err := d.rebindDisputeID(own, ownID); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// 无正式段：只登记/重绑外来，不造本人空白行。
+	if existing := d.disputes[foreign.ID]; existing != nil {
+		existing.Content = content
+		existing.BaseIDs = baseIDs
+		existing.Action = action
+		existing.Pending = nil
+		return nil
+	}
+	if other := d.byPerson(line, action, foreign.Person); other != nil {
+		if err := d.rebindDisputeID(other, foreign.ID); err != nil {
+			return err
+		}
+		other.Content = content
+		other.BaseIDs = baseIDs
+		other.Action = action
+		other.Followers = d.seedFollowMeta(foreign.ID, foreign.Followers, foreign.Pending)
+		other.Pending = nil
+		return nil
+	}
+	d.disputes[foreign.ID] = &model.Dispute{
+		ID:        foreign.ID,
+		RealLine:  line,
+		Action:    action,
+		Person:    foreign.Person,
+		Content:   content,
+		BaseIDs:   baseIDs,
+		Followers: d.seedFollowMeta(foreign.ID, foreign.Followers, foreign.Pending),
+	}
+	return nil
+}
+
+func (d *Doc) rebindDisputeID(item *model.Dispute, newID model.ID) error {
+	if item == nil {
+		return ErrBroken
+	}
+	if item.ID == newID {
+		return nil
+	}
+	if d.disputes[newID] != nil {
+		return ErrBroken
+	}
+	old := item.ID
+	delete(d.disputes, old)
+	if d.suspended[old] {
+		delete(d.suspended, old)
+		d.suspended[newID] = true
+	}
+	for i := range d.pending {
+		if d.pending[i].dispute == old {
+			d.pending[i].dispute = newID
+		}
+	}
+	item.ID = newID
+	d.disputes[newID] = item
+	return nil
+}
+
 func (d *Doc) detachFollow(person string, line model.ID, action string) {
 	group := d.group(line, action)
 	leader := followedLeader(group, person)

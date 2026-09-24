@@ -6,10 +6,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KDreamelf/collaborative-editor/internal/document"
 	"github.com/KDreamelf/collaborative-editor/internal/model"
 	"github.com/KDreamelf/collaborative-editor/internal/protocol"
+	"github.com/gorilla/websocket"
 )
 
 func TestHTTPCreateAndList(t *testing.T) {
@@ -51,790 +53,283 @@ func TestCreateArticle(t *testing.T) {
 	}
 }
 
-func TestTwoJoinOwnLines(t *testing.T) {
+func TestFormalWSNeutralPath(t *testing.T) {
 	h := NewHub(nil)
 	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	h.join(r, &wsClient{}, "p2", "乙")
-	v, err := h.GetView(meta.ID)
-	if err != nil || len(v.Lines) < 2 {
-		t.Fatalf("两人加入后应至少两行: %+v %v", v, err)
-	}
-	r.mu.Lock()
-	cur2, ok := r.cursors["p2"]
-	n := len(r.joinOrder)
-	r.mu.Unlock()
-	if !ok || cur2.LineID != v.Lines[1].ID.Hex() {
-		t.Fatalf("第二人光标应在自己的行: %+v lines=%+v", cur2, v.Lines)
-	}
-	h.join(r, &wsClient{}, "p1", "甲")
-	r.mu.Lock()
-	n2 := len(r.joinOrder)
-	r.mu.Unlock()
-	if n != 2 || n2 != 2 {
-		t.Fatalf("重复 join 不该再占位: %d %d", n, n2)
-	}
-}
+	srv := httptest.NewServer(http.HandlerFunc(h.handleWS))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-func TestSubmitConflictKeepsFormalAndTwoDisputes(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	h.join(r, &wsClient{}, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{
-		Seq: 1,
-		Ops: []protocol.Op{{
-			Kind: protocol.TypeSubmit,
-			Submit: &protocol.Submit{
-				PersonID: "p1",
-				LineID:   line,
-				Action:   model.ActionEdit,
-				Content:  []string{"mine"},
-			},
-		}},
-	})
-	h.applyBatch(r, nil, protocol.Batch{
-		Seq: 2,
-		Ops: []protocol.Op{{
-			Kind: protocol.TypeSubmit,
-			Submit: &protocol.Submit{
-				PersonID: "p2",
-				LineID:   line,
-				Action:   model.ActionEdit,
-				Content:  []string{"yours"},
-			},
-		}},
-	})
-	after, err := h.GetView(meta.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.Lines[0].Content != "" {
-		t.Fatalf("正式行不该被后到的盖掉: %+v", after.Lines[0])
-	}
-	if len(after.Disputes) != 2 {
-		t.Fatalf("应有两份争议: %+v", after.Disputes)
-	}
-}
-
-func TestFollowNeedsNodThenApplies(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	h.join(r, &wsClient{}, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after, _ := h.GetView(meta.ID)
-	var p1Dispute model.ID
-	for _, d := range after.Disputes {
-		if d.Person == "p1" {
-			p1Dispute = d.ID
-		}
-	}
-	if p1Dispute.IsZero() {
-		t.Fatal("找不到 p1 争议")
-	}
-	msgs := h.follow(r, &wsClient{personID: "p2", name: "乙"}, protocol.Follow{
-		PersonID:  "p2",
-		DisputeID: p1Dispute.Hex(),
-		ClientTs:  1,
-	})
-	pending := false
-	for _, m := range msgs {
-		var head struct {
-			Type   string `json:"type"`
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
+	dial := func(t *testing.T) *websocket.Conn {
+		t.Helper()
+		c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if head.Type == protocol.TypeFollowResult && head.Status == document.FollowPending {
-			pending = true
-		}
+		return c
 	}
-	if !pending {
-		t.Fatalf("点头前应 pending，msgs=%d", len(msgs))
-	}
-	mid, _ := h.GetView(meta.ID)
-	if len(mid.Disputes) != 2 || mid.Lines[0].Content != "" {
-		t.Fatalf("点头前争议还在、正文未定: %+v", mid)
-	}
-	h.followAnswer(r, protocol.FollowAnswer{
-		PersonID:  "p1",
-		FromID:    "p2",
-		DisputeID: p1Dispute.Hex(),
-		Accept:    true,
-	})
-	done, _ := h.GetView(meta.ID)
-	if len(done.Disputes) != 0 || done.Lines[0].Content != "a" {
-		t.Fatalf("点头后正文应是被追随的那份: %+v", done)
-	}
-}
-
-func twoClaims(t *testing.T) (*Hub, *room, string, string) {
-	t.Helper()
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	h.join(r, &wsClient{}, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after, _ := h.GetView(meta.ID)
-	var p1Dispute string
-	for _, d := range after.Disputes {
-		if d.Person == "p1" {
-			p1Dispute = d.ID.Hex()
-		}
-	}
-	if p1Dispute == "" {
-		t.Fatal("找不到 p1 争议")
-	}
-	return h, r, line, p1Dispute
-}
-
-func TestOnlineFollowAskAfterSnapshotAllowsAnswer(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	p1 := &wsClient{personID: "p1", name: "甲"}
-	p2 := &wsClient{personID: "p2", name: "乙"}
-	h.join(r, p1, "p1", "甲")
-	h.join(r, p2, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after, _ := h.GetView(meta.ID)
-	var p1Dispute string
-	for _, d := range after.Disputes {
-		if d.Person == "p1" {
-			p1Dispute = d.ID.Hex()
-		}
-	}
-	if p1Dispute == "" {
-		t.Fatal("找不到 p1 争议")
-	}
-
-	assertTargetCanAnswer := func(t *testing.T, msgs []outbound) {
+	writeJSON := func(t *testing.T, c *websocket.Conn, v any) {
 		t.Helper()
-		var types []string
-		var snap protocol.Snapshot
-		var ask protocol.FollowAsk
-		for _, m := range msgs {
-			if m.client != p1 {
-				continue
+		if err := c.WriteJSON(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readType := func(t *testing.T, c *websocket.Conn, want string) []byte {
+		t.Helper()
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				t.Fatalf("读 %s: %v", want, err)
 			}
 			var head struct {
 				Type string `json:"type"`
 			}
-			if err := json.Unmarshal(m.data, &head); err != nil {
+			if err := json.Unmarshal(data, &head); err != nil {
 				t.Fatal(err)
 			}
-			types = append(types, head.Type)
-			switch head.Type {
-			case protocol.TypeSnapshot:
-				if err := json.Unmarshal(m.data, &snap); err != nil {
-					t.Fatal(err)
-				}
-			case protocol.TypeFollowAsk:
-				if err := json.Unmarshal(m.data, &ask); err != nil {
-					t.Fatal(err)
-				}
+			if head.Type == want {
+				return data
 			}
+			// 丢弃他人光标/结构 Snapshot 等旁路包，继续等目标类型。
 		}
-		snapAt, askAt := -1, -1
-		for i, typ := range types {
-			if typ == protocol.TypeSnapshot && snapAt < 0 {
-				snapAt = i
-			}
-			if typ == protocol.TypeFollowAsk && askAt < 0 {
-				askAt = i
-			}
+	}
+	joinBoot := func(t *testing.T, c *websocket.Conn, personID, name string) protocol.Bootstrap {
+		t.Helper()
+		writeJSON(t, c, protocol.Join{
+			Type: protocol.TypeJoin, ArticleID: meta.ID, PersonID: personID, Name: name,
+		})
+		raw := readType(t, c, protocol.TypeBootstrap)
+		var boot protocol.Bootstrap
+		if err := json.Unmarshal(raw, &boot); err != nil {
+			t.Fatal(err)
 		}
-		if snapAt < 0 || askAt < 0 {
-			t.Fatalf("目标应同时收到 Snapshot 与 FollowAsk: %v", types)
+		return boot
+	}
+
+	a := dial(t)
+	defer a.Close()
+	b := dial(t)
+	defer b.Close()
+
+	bootA := joinBoot(t, a, "A", "甲")
+	if bootA.YourLine == "" || len(bootA.Base.Lines) < 1 {
+		t.Fatalf("A Bootstrap: %+v", bootA)
+	}
+	bootB := joinBoot(t, b, "B", "乙")
+	if bootB.YourLine == bootA.YourLine || len(bootB.Base.Lines) != 2 {
+		t.Fatalf("B 应分到第二条初始行: %+v", bootB)
+	}
+	line := bootA.Base.Lines[0].ID.Hex()
+
+	// 普通 Edit：Relay，不造争议，不广播全局 Snapshot。
+	writeJSON(t, a, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 1,
+		Ops: []protocol.Op{{
+			ID: "e1", Kind: protocol.TypeSubmit,
+			Submit: &protocol.Submit{PersonID: "A", LineID: line, Action: model.ActionEdit, Content: []string{"甲"}},
+		}},
+	})
+	ackRaw := readType(t, a, protocol.TypeAck)
+	var ack protocol.Ack
+	if err := json.Unmarshal(ackRaw, &ack); err != nil || ack.Applied != 1 || ack.Message != "" {
+		t.Fatalf("Edit ACK: %s err=%v", ackRaw, err)
+	}
+	relayRaw := readType(t, b, protocol.TypeRelay)
+	var editEv protocol.RelayEvent
+	if err := json.Unmarshal(relayRaw, &editEv); err != nil || editEv.Op.ID != "e1" {
+		t.Fatalf("B 应收 Edit Relay: %s", relayRaw)
+	}
+	if n := len(mustView(t, h.getRoom(meta.ID)).Disputes); n != 0 {
+		t.Fatalf("普通 Edit 无争议: %d", n)
+	}
+
+	claimID := model.NewID()
+	writeJSON(t, a, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 2,
+		Ops: []protocol.Op{{
+			ID: "ccA", Kind: protocol.TypeDisputeCC,
+			DisputeCC: &protocol.DisputeCC{
+				TargetPersonID: "B",
+				Claim: model.Dispute{
+					ID: claimID, RealLine: bootA.Base.Lines[0].ID, Action: model.ActionEdit, Person: "A",
+					Content: []string{"甲主张"}, Followers: []string{},
+				},
+			},
+		}},
+	})
+	_ = readType(t, a, protocol.TypeAck)
+	_ = readType(t, b, protocol.TypeRelay)
+
+	// late Join：Bootstrap.Disputes 含主张。
+	c := dial(t)
+	defer c.Close()
+	bootC := joinBoot(t, c, "C", "丙")
+	if len(bootC.Disputes) != 1 || bootC.Disputes[0].ID != claimID {
+		t.Fatalf("late Join Disputes: %+v", bootC.Disputes)
+	}
+	for _, d := range bootC.Disputes {
+		if len(d.Pending) != 0 && d.Pending[0].From == "" {
+			t.Fatalf("Pending 形状异常: %+v", d)
 		}
-		if snapAt > askAt {
-			t.Fatalf("目标连接须先 Snapshot 再 FollowAsk: %v", types)
-		}
-		var pendingOK bool
-		for _, d := range snap.Disputes {
-			if d.ID.Hex() == p1Dispute && len(d.Pending) == 1 && d.Pending[0].From == "p2" {
-				pendingOK = true
-			}
-		}
-		if !pendingOK {
-			t.Fatalf("Snapshot 应含待确认: %+v", snap.Disputes)
-		}
-		loaded, err := document.Load(snap.Article, snap.Lines, snap.Disputes)
+	}
+	_ = c.Close()
+
+	// 身份伪造 Cursor 被覆盖（跳过 C leave 等旁路 Cursors）。
+	writeJSON(t, a, protocol.CursorMsg{
+		Type: protocol.TypeCursor,
+		Cursor: protocol.Cursor{
+			PersonID: "forged", Name: "冒充", LineID: line, Offset: 3, SelEnd: 3,
+		},
+	})
+	cursorOK := false
+	_ = b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for !cursorOK {
+		_, curRaw, err := b.ReadMessage()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("读 Cursors: %v", err)
 		}
-		disputeID, err := model.ParseID(ask.DisputeID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := loaded.AnswerFollow("p1", ask.FromID, disputeID, true)
-		if err != nil || got.Status != document.FollowApplied {
-			t.Fatalf("Load(snapshot) 后应能点头: %+v %v", got, err)
-		}
-	}
-
-	batchMsgs := h.applyBatch(r, p2, protocol.Batch{Seq: 3, Ops: []protocol.Op{{
-		Kind:   protocol.TypeFollow,
-		Follow: &protocol.Follow{PersonID: "p2", DisputeID: p1Dispute, ClientTs: 11},
-	}}})
-	assertTargetCanAnswer(t, batchMsgs)
-
-	// 重建一场争议，测 legacy 直发 follow
-	h2 := NewHub(nil)
-	meta2 := h2.CreateArticle("t2")
-	r2 := h2.getRoom(meta2.ID)
-	p1b := &wsClient{personID: "p1", name: "甲"}
-	p2b := &wsClient{personID: "p2", name: "乙"}
-	h2.join(r2, p1b, "p1", "甲")
-	h2.join(r2, p2b, "p2", "乙")
-	v2, _ := h2.GetView(meta2.ID)
-	line2 := v2.Lines[0].ID.Hex()
-	h2.applyBatch(r2, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line2, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h2.applyBatch(r2, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line2, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after2, _ := h2.GetView(meta2.ID)
-	var dispute2 string
-	for _, d := range after2.Disputes {
-		if d.Person == "p1" {
-			dispute2 = d.ID.Hex()
-		}
-	}
-	legacyMsgs := h2.follow(r2, p2b, protocol.Follow{PersonID: "p2", DisputeID: dispute2, ClientTs: 12})
-	// 复用同一断言逻辑，换目标 client 与争议 ID
-	p1, p1Dispute = p1b, dispute2
-	assertTargetCanAnswer(t, legacyMsgs)
-}
-
-func TestBatchFollowKeepsOrderAndDedups(t *testing.T) {
-	h, r, line, p1Dispute := twoClaims(t)
-	opID := "follow-1"
-	follow := protocol.Op{
-		ID:   opID,
-		Kind: protocol.TypeFollow,
-		Follow: &protocol.Follow{
-			PersonID:  "p2",
-			DisputeID: p1Dispute,
-			ClientTs:  1,
-		},
-	}
-	edit := protocol.Op{
-		ID:     "edit-after",
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line, Action: model.ActionEdit, Content: []string{"b2"}},
-	}
-	ackMsgs := h.applyBatch(r, &wsClient{personID: "p2", name: "乙"}, protocol.Batch{
-		Seq: 3,
-		Ops: []protocol.Op{follow, edit},
-	})
-	gotAck := false
-	gotPending := false
-	for _, m := range ackMsgs {
-		var head struct {
-			Type    string `json:"type"`
-			Status  string `json:"status"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
-			t.Fatal(err)
-		}
-		if head.Type == protocol.TypeAck {
-			gotAck = true
-			if head.Applied != 2 || head.Message != "" {
-				t.Fatalf("应按序执行 follow 再 edit: %+v", head)
-			}
-		}
-		if head.Type == protocol.TypeFollowResult && head.Status == document.FollowPending {
-			gotPending = true
-		}
-	}
-	if !gotAck || !gotPending {
-		t.Fatalf("应有 ack 和 pending，msgs=%d ack=%v pending=%v", len(ackMsgs), gotAck, gotPending)
-	}
-
-	dup := h.applyBatch(r, &wsClient{personID: "p2", name: "乙"}, protocol.Batch{
-		Seq: 4,
-		Ops: []protocol.Op{follow},
-	})
-	for _, m := range dup {
-		var head struct {
-			Type    string `json:"type"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-			Status  string `json:"status"`
-		}
-		_ = json.Unmarshal(m.data, &head)
-		if head.Type == protocol.TypeAck && (head.Applied != 1 || head.Message != "") {
-			t.Fatalf("同 ID 重发应算已应用、不再报错: %+v", head)
-		}
-		if head.Type == protocol.TypeFollowResult {
-			t.Fatalf("去重后不该再发 FollowResult: %s", m.data)
-		}
-	}
-	mid, _ := h.GetView(tArticle(r))
-	var p1 model.Dispute
-	for _, d := range mid.Disputes {
-		if d.Person == "p1" {
-			p1 = d
-		}
-	}
-	if len(p1.Followers) != 0 {
-		t.Fatalf("pending 追随不该已经点头: %+v", p1)
-	}
-}
-
-func tArticle(r *room) string {
-	return r.doc.Article().ID.Hex()
-}
-
-func TestOfflineFollowAskDeliveredOnJoin(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	p2 := &wsClient{personID: "p2", name: "乙"}
-	h.join(r, p2, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p2", LineID: line, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after, _ := h.GetView(meta.ID)
-	var p1Dispute string
-	for _, d := range after.Disputes {
-		if d.Person == "p1" {
-			p1Dispute = d.ID.Hex()
-		}
-	}
-	if p1Dispute == "" {
-		t.Fatal("找不到 p1 争议")
-	}
-	r.mu.Lock()
-	r.dirty = false
-	r.mu.Unlock()
-
-	msgs := h.follow(r, p2, protocol.Follow{PersonID: "p2", DisputeID: p1Dispute, ClientTs: 7})
-	for _, m := range msgs {
-		var head struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(m.data, &head)
-		if head.Type == protocol.TypeFollowAsk {
-			t.Fatal("目标离线时不应发出 FollowAsk")
-		}
-	}
-	mid, _ := h.GetView(meta.ID)
-	var pendingN int
-	for _, d := range mid.Disputes {
-		if d.Person == "p1" {
-			pendingN = len(d.Pending)
-			if pendingN != 1 || d.Pending[0].From != "p2" || d.Pending[0].ClientTs != 7 {
-				t.Fatalf("离线请求应写入待确认: %+v", d)
-			}
-		}
-	}
-	if pendingN != 1 {
-		t.Fatal("应有一条待确认")
-	}
-	r.mu.Lock()
-	if !r.dirty {
-		r.mu.Unlock()
-		t.Fatal("pending 追随应标 dirty 待刷 Mongo")
-	}
-	r.mu.Unlock()
-
-	p1 := &wsClient{}
-	joinMsgs := h.join(r, p1, "p1", "甲")
-	var ask protocol.FollowAsk
-	gotAsk := false
-	for _, m := range joinMsgs {
-		if m.client != p1 {
+		if outboundType(t, curRaw) != protocol.TypeCursors {
 			continue
 		}
-		var head struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
+		var curs cursorsMsg
+		if err := json.Unmarshal(curRaw, &curs); err != nil {
 			t.Fatal(err)
 		}
-		if head.Type == protocol.TypeFollowAsk {
-			if err := json.Unmarshal(m.data, &ask); err != nil {
-				t.Fatal(err)
+		for _, cur := range curs.Cursors {
+			if cur.PersonID == "forged" || cur.Name == "冒充" {
+				t.Fatalf("光标身份未覆盖: %+v", curs.Cursors)
 			}
-			gotAsk = true
-		}
-	}
-	if !gotAsk {
-		t.Fatalf("目标 join 应补发 FollowAsk，msgs=%d", len(joinMsgs))
-	}
-	if ask.FromID != "p2" || ask.FromName != "乙" || ask.DisputeID != p1Dispute || ask.ClientTs != 7 {
-		t.Fatalf("补发 FollowAsk 字段不对: %+v", ask)
-	}
-
-	// 再 join 一次只重发询问，不增加待确认
-	p1b := &wsClient{}
-	h.join(r, p1b, "p1", "甲")
-	still, _ := h.GetView(meta.ID)
-	for _, d := range still.Disputes {
-		if d.Person == "p1" && len(d.Pending) != 1 {
-			t.Fatalf("重连不得复制待确认: %+v", d)
+			if cur.PersonID == "A" && cur.Name == "甲" && cur.Offset == 3 {
+				cursorOK = true
+			}
 		}
 	}
 
-	h.followAnswer(r, protocol.FollowAnswer{
-		PersonID: "p1", FromID: "p2", DisputeID: p1Dispute, Accept: true,
+	// ACK 失败 Message 自然且非空。
+	writeJSON(t, a, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 3,
+		Ops: []protocol.Op{{
+			ID: "bad", Kind: protocol.TypeSubmit,
+			Submit: &protocol.Submit{PersonID: "A", LineID: "not-a-line-id", Action: model.ActionEdit, Content: []string{"拒"}},
+		}},
 	})
-	done, _ := h.GetView(meta.ID)
-	if len(done.Disputes) != 0 || done.Lines[0].Content != "a" {
-		t.Fatalf("点头后应收束: %+v", done)
-	}
-}
-
-func TestFollowAskFromNameFallback(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "p1", LineID: line, Action: model.ActionEdit, Content: []string{"a"}},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		Kind:   protocol.TypeSubmit,
-		Submit: &protocol.Submit{PersonID: "ghost", LineID: line, Action: model.ActionEdit, Content: []string{"b"}},
-	}}})
-	after, _ := h.GetView(meta.ID)
-	var p1Dispute string
-	for _, d := range after.Disputes {
-		if d.Person == "p1" {
-			p1Dispute = d.ID.Hex()
-		}
-	}
-	// ghost 从未 join，names 里没有；follow 时 client.name 也空
-	h.follow(r, &wsClient{personID: "ghost"}, protocol.Follow{
-		PersonID: "ghost", DisputeID: p1Dispute, ClientTs: 1,
-	})
-	joinMsgs := h.join(r, &wsClient{}, "p1", "甲")
-	for _, m := range joinMsgs {
-		var ask protocol.FollowAsk
-		if err := json.Unmarshal(m.data, &ask); err != nil {
-			continue
-		}
-		if ask.Type == protocol.TypeFollowAsk {
-			if ask.FromName != "有人" || ask.FromID != "ghost" {
-				t.Fatalf("离线无名发起人 FromName 应为「有人」: %+v", ask)
-			}
-			return
-		}
-	}
-	t.Fatal("应收到 FollowAsk")
-}
-
-func TestBatchAnswerFollowDedupDoesNotRerun(t *testing.T) {
-	h, r, _, p1Dispute := twoClaims(t)
-	h.applyBatch(r, nil, protocol.Batch{Seq: 3, Ops: []protocol.Op{{
-		ID:     "f1",
-		Kind:   protocol.TypeFollow,
-		Follow: &protocol.Follow{PersonID: "p2", DisputeID: p1Dispute, ClientTs: 1},
-	}}})
-	ans := protocol.Op{
-		ID:   "ans-1",
-		Kind: protocol.TypeFollowAnswer,
-		FollowAnswer: &protocol.FollowAnswer{
-			PersonID:  "p1",
-			FromID:    "p2",
-			DisputeID: p1Dispute,
-			Accept:    true,
-		},
-	}
-	h.applyBatch(r, nil, protocol.Batch{Seq: 4, Ops: []protocol.Op{ans}})
-	done, _ := h.GetView(tArticle(r))
-	if len(done.Disputes) != 0 || done.Lines[0].Content != "a" {
-		t.Fatalf("点头后正文应是被追随的那份: %+v", done)
-	}
-	again := h.applyBatch(r, nil, protocol.Batch{Seq: 5, Ops: []protocol.Op{ans}})
-	for _, m := range again {
-		var head struct {
-			Type    string `json:"type"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-		}
-		_ = json.Unmarshal(m.data, &head)
-		if head.Type == protocol.TypeAck && (head.Applied != 1 || head.Message != "") {
-			t.Fatalf("AnswerFollow 重发不该再执行或打断后续: %+v", head)
-		}
-	}
-	still, _ := h.GetView(tArticle(r))
-	if len(still.Disputes) != 0 || still.Lines[0].Content != "a" {
-		t.Fatalf("去重后文档不该变: %+v", still)
-	}
-}
-
-func TestSpanEditBatchOneOp(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	v, _ := h.GetView(meta.ID)
-	line := v.Lines[0].ID.Hex()
-	id1, id2 := model.NewID(), model.NewID()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		ID:   "paste-1",
-		Kind: protocol.TypeSubmit,
-		Submit: &protocol.Submit{
-			PersonID: "p1",
-			LineID:   line,
-			Action:   model.ActionEdit,
-			Content:  []string{"A", "B", "C"},
-			LineIDs:  []string{id1.Hex(), id2.Hex()},
-		},
-	}}})
-	mid, err := h.GetView(meta.ID)
-	if err != nil || len(mid.Lines) != 3 {
-		t.Fatalf("粘贴三行: %+v %v", mid, err)
-	}
-	spanID := model.NewID()
-	client := &wsClient{}
-	msgs := h.applyBatch(r, client, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		ID:   "span-1",
-		Kind: protocol.TypeSpanEdit,
-		SpanEdit: &protocol.SpanEdit{
-			Type:        protocol.TypeSpanEdit,
-			PersonID:    "p1",
-			BaseIDs:     []string{mid.Lines[0].ID.Hex(), mid.Lines[1].ID.Hex()},
-			BaseTexts:   []string{"A", "B"},
-			AfterSeen:   mid.Lines[2].ID.Hex(),
-			Replacement: []string{"X", "Y"},
-			LineIDs:     []string{spanID.Hex()},
-		},
-	}}})
-	acked := false
-	for _, m := range msgs {
-		var head struct {
-			Type    string `json:"type"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
-			continue
-		}
-		if head.Type == protocol.TypeAck {
-			acked = true
-			if head.Applied != 1 || head.Message != "" {
-				t.Fatalf("spanEdit 应整包成功: %+v", head)
-			}
-		}
-	}
-	if !acked {
-		t.Fatal("应有 Ack")
-	}
-	after, _ := h.GetView(meta.ID)
-	if len(after.Lines) != 3 || after.Lines[0].Content != "X" || after.Lines[1].Content != "Y" || after.Lines[2].Content != "C" {
-		t.Fatalf("服务端正文: %+v", after.Lines)
-	}
-	if after.Lines[0].ID != mid.Lines[0].ID || after.Lines[1].ID != spanID || after.Lines[2].ID != mid.Lines[2].ID {
-		t.Fatalf("ID 稳定/预生: %+v", after.Lines)
-	}
-}
-
-func TestInsertBeforeDisputeAnchorIsOriginalLine(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	h.join(r, &wsClient{}, "p2", "乙")
-	v, _ := h.GetView(meta.ID)
-	if len(v.Lines) < 2 {
-		_ = r.doc.EnsureLines(2)
-		v, _ = h.GetView(meta.ID)
-	}
-	l1, l2 := v.Lines[0].ID, v.Lines[1].ID
-	idA, idB := model.NewID(), model.NewID()
-	before := l1.Hex()
-	h.applyBatch(r, nil, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		ID:   "before-a",
-		Kind: protocol.TypeSubmit,
-		Submit: &protocol.Submit{
-			PersonID:   "p1",
-			LineID:     l2.Hex(),
-			Action:     model.ActionInsertBefore,
-			Content:    []string{"甲前"},
-			BeforeSeen: &before,
-			LineIDs:    []string{idA.Hex()},
-		},
-	}}})
-	h.applyBatch(r, nil, protocol.Batch{Seq: 2, Ops: []protocol.Op{{
-		ID:   "before-b",
-		Kind: protocol.TypeSubmit,
-		Submit: &protocol.Submit{
-			PersonID:   "p2",
-			LineID:     l2.Hex(),
-			Action:     model.ActionInsertBefore,
-			Content:    []string{"乙前"},
-			BeforeSeen: &before,
-			LineIDs:    []string{idB.Hex()},
-		},
-	}}})
-	after, err := h.GetView(meta.ID)
-	if err != nil {
+	failRaw := readType(t, a, protocol.TypeAck)
+	var failAck protocol.Ack
+	if err := json.Unmarshal(failRaw, &failAck); err != nil {
 		t.Fatal(err)
 	}
-	found := 0
-	for _, d := range after.Disputes {
-		if d.Action != model.ActionInsertBefore {
-			continue
-		}
-		found++
-		if d.RealLine != l2 {
-			t.Fatalf("before 争议 anchor 须为下方原行: got %s want %s action=%s content=%v",
-				d.RealLine.Hex(), l2.Hex(), d.Action, d.Content)
-		}
-		if len(d.Content) != 1 || (d.Content[0] != "甲前" && d.Content[0] != "乙前") {
-			t.Fatalf("Content 仅插入段: %+v", d)
-		}
+	if failAck.Applied != 0 || failAck.Message == "" || ackHasProtocolLeak(failAck.Message) {
+		t.Fatalf("失败 ACK 应自然非空: %+v", failAck)
 	}
-	if found < 2 {
-		t.Fatalf("应有两份插在前面争议: disputes=%+v lines=%+v", after.Disputes, after.Lines)
-	}
-}
 
-func TestInsertAfterStillWorksWithBeforeSeenField(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	v, _ := h.GetView(meta.ID)
-	if len(v.Lines) < 2 {
-		_ = r.doc.EnsureLines(2)
-		v, _ = h.GetView(meta.ID)
+	// 目标离线 Follow → 重连收 raw Follow → Answer。
+	claimB := model.NewID()
+	writeJSON(t, b, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 1,
+		Ops: []protocol.Op{{
+			ID: "ccB", Kind: protocol.TypeDisputeCC,
+			DisputeCC: &protocol.DisputeCC{
+				TargetPersonID: "A",
+				Claim: model.Dispute{
+					ID: claimB, RealLine: bootA.Base.Lines[0].ID, Action: model.ActionEdit, Person: "B",
+					Content: []string{"乙主张"}, Followers: []string{},
+				},
+			},
+		}},
+	})
+	_ = readType(t, b, protocol.TypeAck)
+	_ = readType(t, a, protocol.TypeRelay)
+
+	_ = b.Close()
+	// leave 异步；稍等房间摘掉 B。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r := h.getRoom(meta.ID)
+		r.mu.Lock()
+		n := 0
+		for c := range r.clients {
+			if c.personID == "B" {
+				n++
+			}
+		}
+		r.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("B 离开超时")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	anchor, tail := v.Lines[0].ID, v.Lines[1].ID
-	newID := model.NewID()
-	afterSeen := tail.Hex()
-	msgs := h.applyBatch(r, &wsClient{}, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		ID:   "after-1",
-		Kind: protocol.TypeSubmit,
-		Submit: &protocol.Submit{
-			PersonID:  "p1",
-			LineID:    anchor.Hex(),
-			Action:    model.ActionInsert,
-			Content:   []string{"后插"},
-			AfterSeen: &afterSeen,
-			LineIDs:   []string{newID.Hex()},
-		},
-	}}})
-	acked := false
-	for _, m := range msgs {
-		var head struct {
-			Type    string `json:"type"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
-			continue
-		}
-		if head.Type == protocol.TypeAck {
-			acked = true
-			if head.Applied != 1 || head.Message != "" {
-				t.Fatalf("旧 after 应成功: %+v", head)
+
+	writeJSON(t, a, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 4,
+		Ops: []protocol.Op{{
+			ID: "f1", Kind: protocol.TypeFollow,
+			Follow: &protocol.Follow{PersonID: "A", DisputeID: claimB.Hex(), ClientTs: 9},
+		}},
+	})
+	_ = readType(t, a, protocol.TypeAck)
+
+	b2 := dial(t)
+	defer b2.Close()
+	writeJSON(t, b2, protocol.Join{
+		Type: protocol.TypeJoin, ArticleID: meta.ID, PersonID: "B", Name: "乙",
+	})
+	bootB2Raw := readType(t, b2, protocol.TypeBootstrap)
+	var bootB2 protocol.Bootstrap
+	if err := json.Unmarshal(bootB2Raw, &bootB2); err != nil {
+		t.Fatal(err)
+	}
+	pendingOK := false
+	for _, d := range bootB2.Disputes {
+		if d.ID == claimB {
+			for _, p := range d.Pending {
+				if p.From == "A" && p.To == "B" && p.ClientTs == 9 {
+					pendingOK = true
+				}
 			}
 		}
 	}
-	if !acked {
-		t.Fatal("应有 Ack")
+	if !pendingOK {
+		t.Fatalf("重连 Bootstrap 应含 Pending: %+v", bootB2.Disputes)
 	}
-	after, _ := h.GetView(meta.ID)
-	if len(after.Lines) < 3 || after.Lines[1].ID != newID || after.Lines[1].Content != "后插" {
-		t.Fatalf("旧 after 入链: %+v", after.Lines)
+	followRaw := readType(t, b2, protocol.TypeRelay)
+	var followEv protocol.RelayEvent
+	if err := json.Unmarshal(followRaw, &followEv); err != nil {
+		t.Fatal(err)
 	}
-}
+	if followEv.Op.Kind != protocol.TypeFollow || followEv.Op.Follow == nil ||
+		followEv.Op.Follow.PersonID != "A" || followEv.Op.Follow.DisputeID != claimB.Hex() ||
+		followEv.Op.Follow.ClientTs != 9 {
+		t.Fatalf("重连应 raw Follow: %+v", followEv)
+	}
+	wantID := pendingFollowOpID(claimB.Hex(), "A", "B", 9)
+	if followEv.Op.ID != wantID {
+		t.Fatalf("pending Op.ID: got %q want %q", followEv.Op.ID, wantID)
+	}
+	if strings.Contains(string(followRaw), protocol.TypeFollowAsk) {
+		t.Fatal("不得发旧 FollowAsk")
+	}
 
-func TestSpanEditUnknownKindRejected(t *testing.T) {
-	h := NewHub(nil)
-	meta := h.CreateArticle("t")
-	r := h.getRoom(meta.ID)
-	h.join(r, &wsClient{}, "p1", "甲")
-	before, _ := h.GetView(meta.ID)
-	client := &wsClient{}
-	msgs := h.applyBatch(r, client, protocol.Batch{Seq: 1, Ops: []protocol.Op{{
-		ID:   "bad-kind",
-		Kind: "spanEditTypo",
-		SpanEdit: &protocol.SpanEdit{
-			PersonID:    "p1",
-			BaseIDs:     []string{before.Lines[0].ID.Hex(), model.NewID().Hex()},
-			BaseTexts:   []string{"", "x"},
-			Replacement: []string{"Z"},
-		},
-	}}})
-	gotReject := false
-	for _, m := range msgs {
-		var head struct {
-			Type    string `json:"type"`
-			Applied int    `json:"applied"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(m.data, &head); err != nil {
-			continue
-		}
-		if head.Type == protocol.TypeAck {
-			gotReject = true
-			if head.Applied != 0 || !strings.Contains(head.Message, "未知操作") {
-				t.Fatalf("未知 kind 须拒绝: %+v", head)
-			}
-		}
+	writeJSON(t, b2, protocol.Batch{
+		Type: protocol.TypeBatch, Seq: 2,
+		Ops: []protocol.Op{{
+			ID: "ans1", Kind: protocol.TypeFollowAnswer,
+			FollowAnswer: &protocol.FollowAnswer{
+				PersonID: "B", FromID: "A", DisputeID: claimB.Hex(), Accept: true,
+			},
+		}},
+	})
+	ansAckRaw := readType(t, b2, protocol.TypeAck)
+	var ansAck protocol.Ack
+	if err := json.Unmarshal(ansAckRaw, &ansAck); err != nil || ansAck.Applied != 1 || ansAck.Message != "" {
+		t.Fatalf("Answer ACK: %s", ansAckRaw)
 	}
-	if !gotReject {
-		t.Fatal("应有拒绝 Ack")
-	}
-	after, _ := h.GetView(meta.ID)
-	if after.Lines[0].Content != before.Lines[0].Content {
-		t.Fatalf("拒绝不得改正文: %+v", after.Lines)
+	done := mustView(t, h.getRoom(meta.ID))
+	if len(done.Disputes) != 0 || done.Lines[0].Content != "乙主张" {
+		t.Fatalf("Answer 后应收束到乙主张: %+v", done)
 	}
 }
 

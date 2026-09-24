@@ -29,7 +29,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #716b5e; outline-
 .muted { color: #706b60; }
 .error { color: #9c3328; overflow-wrap: anywhere; }
 .warning { color: #80601e; }
-.page-enter-active, .page-leave-active, .panel-enter-active, .panel-leave-active { transition: opacity 200ms cubic-bezier(.22,1,.36,1), transform 200ms cubic-bezier(.22,1,.36,1); }
-.page-enter-from, .page-leave-to { opacity: 0; transform: translateY(6px); }
-.panel-enter-from, .panel-leave-to { opacity: 0; transform: translateY(-6px); }
+.page-enter-active { transition: opacity 140ms cubic-bezier(.2,0,0,1), transform 140ms cubic-bezier(.2,0,0,1); }
+.page-leave-active { transition: opacity 100ms cubic-bezier(.4,0,1,1), transform 100ms cubic-bezier(.4,0,1,1); }
+.page-enter-from, .page-leave-to { opacity: 0; transform: translateY(4px); }
+.panel-enter-active, .panel-leave-active { transition: grid-template-rows 220ms cubic-bezier(.4,0,.2,1), opacity 180ms cubic-bezier(.4,0,.2,1); }
+.panel-enter-from, .panel-leave-to { grid-template-rows: 0fr; opacity: 0; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }

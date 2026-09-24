@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
-  AnswerFollow, CreateArticle, DismissUnsynced, GetCachedArticle, GetSaveWarning,
+  CreateArticle, DismissUnsynced, GetCachedArticle, GetSaveWarning,
   GetServer, Join, ListArticles, ListUnsynced, PersonID, SetServer,
 } from '../wailsjs/go/main/App'
 import { main } from '../wailsjs/go/models'
@@ -10,7 +10,7 @@ import SingleEditor from './components/SingleEditor.vue'
 import ModalDialog from './components/ModalDialog.vue'
 import { formatUserError } from './errors'
 import { buildVisualRows } from './layout'
-import type { Cursor, FollowAsk, FollowResult, Snapshot } from './types'
+import type { Cursor, FollowResult, Snapshot } from './types'
 
 const me = ref('')
 const name = ref('')
@@ -34,13 +34,10 @@ const serverAddress = ref('')
 const serverDraft = ref('')
 const showServer = ref(false)
 const serverError = ref('')
-const asks = ref<FollowAsk[]>([])
-const showAsk = ref(false)
 const discard = ref<main.UnsyncedItem | null>(null)
 const editor = ref<InstanceType<typeof SingleEditor> | null>(null)
 const listHeading = ref<HTMLElement | null>(null)
 const rows = computed(() => buildVisualRows(snap.value, me.value))
-const ask = computed(() => asks.value[0])
 const unsubscribers: (() => void)[] = []
 let listRequest = 0
 
@@ -76,8 +73,6 @@ async function enter(id: string) {
   notice.value = ''
   snap.value = null
   cursors.value = []
-  asks.value = []
-  showAsk.value = false
   try {
     await Join(id, name.value.trim() || '未命名')
     joined.value = true
@@ -107,8 +102,6 @@ async function backToList() {
     joined.value = false
     activeID.value = ''
     showUnsynced.value = false
-    showAsk.value = false
-    asks.value = []
     errorText.value = ''
     notice.value = ''
     await Promise.all([loadArticles(), loadCached()])
@@ -164,19 +157,6 @@ async function dismissUnsynced() {
   } catch (e) { showError(e) }
   finally { busy.value = false }
 }
-async function answerFollow(accept: boolean) {
-  const current = ask.value
-  if (!current || busy.value) return
-  busy.value = true
-  try {
-    await AnswerFollow(current.fromId, current.disputeId, accept)
-    asks.value = asks.value.filter((a) => a !== current)
-    showAsk.value = asks.value.length > 0
-    notice.value = accept ? '已同意追随' : '已拒绝追随'
-  } catch (e) { showError(e) }
-  finally { busy.value = false }
-}
-
 onMounted(async () => {
   if (import.meta.env.DEV && new URLSearchParams(location.search).get('mock') === '1') {
     const m = (await import('./devMock')).loadDevMock()
@@ -197,21 +177,14 @@ onMounted(async () => {
       if (s.article.id !== activeID.value) return
       snap.value = s
       cursors.value = s.cursors || []
-      asks.value = asks.value.filter((a) => s.disputes.some((d) => d.id === a.disputeId &&
-        d.pendingConfirm?.some((p) => p.from === a.fromId && p.to === me.value)))
-      if (!asks.value.length) showAsk.value = false
     }),
     EventsOn('cursors', (cs: Cursor[]) => { if (activeID.value) cursors.value = cs || [] }),
     EventsOn('unsynced', (list: main.UnsyncedItem[]) => { unsynced.value = list || [] }),
     EventsOn('offline', (on: boolean) => { offline.value = !!on }),
     EventsOn('saveWarning', (warning: string) => { saveWarning.value = warning || '' }),
-    EventsOn('followAsk', (incoming: FollowAsk) => {
-      if (!activeID.value || !snap.value?.disputes.some((d) => d.id === incoming.disputeId)) return
-      if (!asks.value.some((a) => a.fromId === incoming.fromId && a.disputeId === incoming.disputeId)) asks.value.push(incoming)
-    }),
     EventsOn('followResult', (result: FollowResult) => {
-      notice.value = ({ pending: '追随请求已送出，等待对方确认', applied: '追随已生效',
-        denied: '对方未接受追随，你的主张仍保留', lost: '对方的追随先发出，已同步结果，请重新选择' } as Record<string, string>)[result.status] || ''
+      notice.value = ({ pending: '正在同步追随', applied: '追随已生效',
+        denied: '追随未生效，请重试', lost: '对方的追随先发出，已同步结果，请重新选择' } as Record<string, string>)[result.status] || ''
     }),
     EventsOn('error', showError),
   )
@@ -259,19 +232,22 @@ onBeforeUnmount(() => { ++listRequest; unsubscribers.forEach((off) => off()) })
         <button class="quiet" :disabled="busy" @click="backToList">返回文档</button>
         <strong class="document-title">{{ snap?.article.title || '正在打开文档…' }}</strong>
         <span v-if="offline" class="muted" role="status">当前离线，连接后自动发送</span>
-        <button v-if="asks.length" @click="showAsk = true">{{ asks.length }} 个追随请求</button>
         <button v-if="unsynced.length" class="quiet" :aria-expanded="showUnsynced" @click="showUnsynced = !showUnsynced">{{ unsynced.length }} 处未能同步</button>
       </header>
       <p v-if="saveWarning" class="banner warning" role="status">{{ saveWarning }}</p>
       <p v-if="errorText" class="banner error" role="alert">{{ errorText }}<button class="quiet" aria-label="关闭提示" @click="errorText = ''">×</button></p>
       <p v-if="notice" class="banner muted" role="status">{{ notice }}<button class="quiet" aria-label="关闭通知" @click="notice = ''">×</button></p>
       <Transition name="panel">
-        <section v-if="showUnsynced && unsynced.length" class="unsynced-panel" aria-label="未同步修改">
-          <article v-for="u in unsynced" :key="u.id">
-            <p>{{ u.summary }}</p><pre>{{ u.text || '（无文字）' }}</pre>
-            <div class="actions"><button @click="copyUnsynced(u)">复制原文</button><button class="quiet" @click="discard = u">删除本地副本</button></div>
-          </article>
-        </section>
+        <div v-if="showUnsynced && unsynced.length" class="unsynced-reveal">
+          <section class="unsynced-panel" aria-label="未同步修改">
+            <div class="unsynced-panel-content">
+              <article v-for="u in unsynced" :key="u.id">
+                <p>{{ u.summary }}</p><pre>{{ u.text || '（无文字）' }}</pre>
+                <div class="actions"><button @click="copyUnsynced(u)">复制原文</button><button class="quiet" @click="discard = u">删除本地副本</button></div>
+              </article>
+            </div>
+          </section>
+        </div>
       </Transition>
       <SingleEditor v-if="snap" ref="editor" :key="activeID" :rows="rows" :me="me" :cursors="cursors" :initial-line-id="snap.yourLine" @error="showError" />
       <p v-else class="loading" role="status">正在打开文档…</p>
@@ -283,9 +259,6 @@ onBeforeUnmount(() => { ++listRequest; unsubscribers.forEach((off) => off()) })
       <p v-if="serverError" class="error" role="alert">{{ serverError }}</p>
       <div class="actions"><button :disabled="busy">{{ busy ? '正在保存…' : '保存' }}</button><button type="button" class="quiet" :disabled="busy" @click="showServer = false">取消</button></div>
     </form>
-  </ModalDialog>
-  <ModalDialog v-model="showAsk" title="追随请求" :busy="busy">
-    <template v-if="ask"><p>{{ ask.fromName || '有人' }} 希望接受你的主张，是否同意？</p><div class="actions"><button :disabled="busy" @click="answerFollow(true)">同意</button><button class="quiet" :disabled="busy" @click="answerFollow(false)">拒绝</button><button class="quiet" :disabled="busy" @click="showAsk = false">稍后</button></div></template>
   </ModalDialog>
   <ModalDialog :model-value="!!discard" title="删除本地副本" :busy="busy" @update:model-value="discard = null">
     <p>删除后将无法找回，请先确认已复制需要的内容。</p><div class="actions"><button class="quiet" :disabled="busy" autofocus @click="discard = null">保留</button><button :disabled="busy" @click="dismissUnsynced">删除副本</button></div>
@@ -310,7 +283,9 @@ h2 { font-size: 1rem; margin: 0; }
 .bar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 16px; background: #ece8df; border-bottom: 1px solid #ddd6c8; }
 .document-title { flex: 1; min-width: 120px; overflow-wrap: anywhere; font-size: .95rem; }
 .banner { margin: 0; padding: 8px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; background: #f0ece3; font-size: .9rem; }
-.unsynced-panel { padding: 16px 24px; background: #eeebe4; max-height: 40vh; overflow: auto; }
+.unsynced-reveal { display: grid; grid-template-rows: 1fr; overflow: hidden; }
+.unsynced-panel { min-height: 0; overflow: hidden; background: #eeebe4; }
+.unsynced-panel-content { max-height: 40vh; overflow: auto; padding: 16px 24px; }
 .unsynced-panel article + article { margin-top: 24px; padding-top: 12px; border-top: 1px solid #d8d2c7; }
 pre { padding: 12px; background: #faf8f3; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .loading { padding: 24px; }

@@ -32,12 +32,12 @@ func connectMongo(uri, dbName string) *mongoStore {
 		log.Printf("mongo connect: %v", err)
 		return nil
 	}
-	store := &mongoStore{client: client, db: client.Database(dbName)}
 	if err := client.Ping(ctx, nil); err != nil {
-		// Connect 已成功则保留 client，交给 driver 后续重连；勿 Disconnect。
-		log.Printf("mongo ping: %v (暂不可用，稍后重试读写)", err)
+		log.Printf("mongo ping: %v", err)
+		_ = client.Disconnect(ctx)
+		return nil
 	}
-	return store
+	return &mongoStore{client: client, db: client.Database(dbName)}
 }
 
 func (s *mongoStore) listIDs(ctx context.Context) ([]string, error) {
