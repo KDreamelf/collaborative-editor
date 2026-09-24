@@ -29,7 +29,17 @@ npm run dev
 
 后台地址 `http://127.0.0.1:5174`，接口 `http://127.0.0.1:8787`。
 
-`fixture/livepeer` 是真人联测夹具：创建「测试」文档，以「测试脚本」身份定时编辑，收到别人的主张后等 10 秒再随机决定是否追随。请在桌面客户端加入该文档联测。
+`fixture/livepeer` 是专属客户端，不是网页替身。脚本按正式协议加入文档、定时编辑；收到写给自己的主张后等 10 秒再随机决定是否追随。旁观到的落盘争议不把自己变成当事人。请在桌面客户端加入该文档联测。
+
+## 未来方向
+
+夹具已经说明：参与编辑不必坐在桌面界面前，一个专属客户端就能代表一个人。AI 用 ACP（Agent Client Protocol，智能体客户端协议）的 stdio 驱动 `fixture/editoracp`，直接加入同一篇文档。
+
+```powershell
+go run ./fixture/editoracp
+```
+
+stdin 一行一个 JSON-RPC。`initialize`、`session/new` 之后，`session/prompt` 的文本是一条命令：`join <http> <articleId> <personId>`、`edit <行号> <正文>`、`say <正文>`、`accept <行号> <人>`、`reject <行号> <人>`、`view`。`say` 在文末另起一行。`accept` 是追随对方主张，`reject` 是不接受、保留自己的句子。stdout 只回协议。编辑规则仍以 `需求设计.md` 为准。
 
 ```powershell
 go run -tags fixture ./fixture/livepeer --server http://127.0.0.1:8787
