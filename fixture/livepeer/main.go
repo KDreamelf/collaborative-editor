@@ -370,25 +370,33 @@ func (p *peer) bootstrapOpLanded(op protocol.Op, boot protocol.Bootstrap, byClai
 	}
 }
 
-// importBootstrapDisputes：他人主张按 Claim.ID 进争议并开 10s；本人只稳 claimID，不自争议。
+// importBootstrapDisputes：先扫本人主张定 claimID，再导入他人，最后才 enqueueOwnCC。
+// 单次遍历若 foreign 排在 own 前，会在读到本人旧 ID 前 NewID，与服务器同槽冲突（ErrBroken）。
 func (p *peer) importBootstrapDisputes(disputes []model.Dispute, disputeC *<-chan time.Time) {
 	p.foreign = map[string]model.Dispute{}
 	for _, d := range disputes {
-		if d.Person == p.personID {
-			if !d.ID.IsZero() {
-				p.claimID = d.ID
-			}
-			continue
+		if d.Person == p.personID && !d.ID.IsZero() {
+			p.claimID = d.ID
 		}
-		if d.ID.IsZero() {
+	}
+	for _, d := range disputes {
+		if d.Person == p.personID || d.ID.IsZero() || !p.ownLineEdit(d) {
 			continue
 		}
 		p.foreign[d.ID.Hex()] = cloneDispute(d)
-		if d.RealLine.Hex() == p.yourLine && d.Action == model.ActionEdit {
-			p.enqueueOwnCC(d.Person)
+	}
+	for _, d := range disputes {
+		if d.Person == p.personID || d.ID.IsZero() || !p.ownLineEdit(d) {
+			continue
 		}
+		p.enqueueOwnCC(d.Person)
 	}
 	p.syncDisputeTimer(disputeC)
+}
+
+// ownLineEdit：夹具只处理本人 yourLine 上的 ActionEdit 主张。
+func (p *peer) ownLineEdit(d model.Dispute) bool {
+	return p.yourLine != "" && d.Action == model.ActionEdit && d.RealLine.Hex() == p.yourLine
 }
 
 func disputeContent(d model.Dispute) string {
@@ -473,13 +481,11 @@ func (p *peer) onDisputeCC(op protocol.Op, disputeC *<-chan time.Time) error {
 		p.confirmedCC[cc.TargetPersonID] = content
 		return nil
 	}
-	// 追随中：目标人 CC 更新直接采纳，不新开 10s 决策。
-	if p.followTarget != "" && claim.Person == p.followTarget {
+	// 追随中：仅本行目标人 CC 更新直接采纳，不新开 10s 决策。
+	if p.followTarget != "" && claim.Person == p.followTarget && p.ownLineEdit(claim) {
 		if len(claim.Content) > 0 {
 			p.ownText = claim.Content[0]
-			if p.yourLine != "" {
-				p.formal[p.yourLine] = p.ownText
-			}
+			p.formal[p.yourLine] = p.ownText
 			p.seeded = true
 		}
 		key := claim.ID.Hex()
@@ -493,11 +499,12 @@ func (p *peer) onDisputeCC(op protocol.Op, disputeC *<-chan time.Time) error {
 		log.Printf("追随中采纳 DisputeCC from=%s own=%q", claim.Person, p.ownText)
 		return p.sendCursor(true)
 	}
+	if !p.ownLineEdit(claim) {
+		return nil
+	}
 	key := claim.ID.Hex()
 	p.foreign[key] = cloneDispute(claim)
-	if claim.RealLine.Hex() == p.yourLine && claim.Action == model.ActionEdit {
-		p.enqueueOwnCC(claim.Person)
-	}
+	p.enqueueOwnCC(claim.Person)
 	log.Printf("收到他人 DisputeCC person=%s claim=%s", claim.Person, key)
 	p.syncDisputeTimer(disputeC)
 	return p.sendCursor(true)
@@ -556,6 +563,11 @@ func (p *peer) onFollowAnswer(op protocol.Op, disputeC *<-chan time.Time) error 
 	d, ok := p.foreign[ans.DisputeID]
 	if !ok {
 		log.Printf("FollowAnswer accept 但本地无该候选 %s", ans.DisputeID)
+		return nil
+	}
+	if !p.ownLineEdit(d) {
+		delete(p.foreign, ans.DisputeID)
+		log.Printf("FollowAnswer 非本行主张，忽略 dispute=%s", ans.DisputeID)
 		return nil
 	}
 	if len(d.Content) > 0 {
@@ -653,7 +665,7 @@ func (p *peer) maybeWrite() error {
 
 func (p *peer) hasUndecidedForeign() bool {
 	for _, d := range p.foreign {
-		if !p.handled[disputeKeyOf(d)] {
+		if p.ownLineEdit(d) && !p.handled[disputeKeyOf(d)] {
 			return true
 		}
 	}
@@ -843,7 +855,9 @@ func (p *peer) syncDisputeTimer(disputeC *<-chan time.Time) {
 	}
 	active := map[string]bool{}
 	for _, d := range p.foreign {
-		active[disputeKeyOf(d)] = true
+		if p.ownLineEdit(d) {
+			active[disputeKeyOf(d)] = true
+		}
 	}
 	for k := range p.handled {
 		if !active[k] {
@@ -858,6 +872,9 @@ func (p *peer) syncDisputeTimer(disputeC *<-chan time.Time) {
 		return
 	}
 	for _, d := range p.foreign {
+		if !p.ownLineEdit(d) {
+			continue
+		}
 		k := disputeKeyOf(d)
 		if p.handled[k] {
 			continue
@@ -878,7 +895,7 @@ func (p *peer) onDisputeTimer() error {
 	}
 	var others []model.Dispute
 	for _, d := range p.foreign {
-		if disputeKeyOf(d) == key {
+		if p.ownLineEdit(d) && disputeKeyOf(d) == key {
 			others = append(others, d)
 		}
 	}

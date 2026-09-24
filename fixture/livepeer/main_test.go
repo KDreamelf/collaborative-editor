@@ -401,6 +401,182 @@ func TestBootstrapForeignDisputeStartsDecision(t *testing.T) {
 	p.stopDisputeTimer()
 }
 
+// 别行主张不得进 foreign / 挡写 / 开 Follow；本行继续普通 Edit。
+func TestOtherLineDisputeIgnoredBootstrapAndLive(t *testing.T) {
+	mine, other := model.NewID(), model.NewID()
+	fid := model.NewID()
+	p := freshPeer("script")
+	p.rng = randSrc(1)
+	var disputeC <-chan time.Time
+	boot := protocol.Bootstrap{
+		Type: protocol.TypeBootstrap, YourLine: mine.Hex(),
+		Base: document.View{
+			Article: model.Article{ID: model.NewID(), Title: "测试"},
+			Lines: []model.Line{
+				{ID: mine, Content: "本行正文"},
+				{ID: other, Content: "别行正文"},
+			},
+		},
+		Disputes: []model.Dispute{{
+			ID: fid, RealLine: other, Action: model.ActionEdit,
+			Person: "user", Content: []string{"别行争议文"},
+		}},
+	}
+	if err := p.applyBootstrap(boot, &disputeC); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.foreign) != 0 || p.disputeTimer != nil || disputeC != nil {
+		t.Fatalf("别行 Bootstrap 主张不得入场 foreign=%d timer=%v", len(p.foreign), p.disputeTimer != nil)
+	}
+	if n := len(p.outQ); n != 0 {
+		t.Fatalf("别行主张不得触发 CC/Follow: %v", kinds(p.outQ))
+	}
+	if p.ownText != "本行正文" {
+		t.Fatalf("本行正文被改: %q", p.ownText)
+	}
+	if err := p.maybeWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.outQ) != 1 || p.outQ[0].Kind != protocol.TypeSubmit || p.outQ[0].Submit.LineID != mine.Hex() {
+		t.Fatalf("本行应能继续普通写: %v", kinds(p.outQ))
+	}
+	p.outQ = nil
+
+	live := protocol.Op{
+		ID: model.NewID().Hex(), Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: "script",
+			Claim: model.Dispute{
+				ID: model.NewID(), RealLine: other, Action: model.ActionEdit,
+				Person: "user", Content: []string{"别行在线CC"},
+			},
+		},
+	}
+	if err := p.onDisputeCC(live, &disputeC); err != nil {
+		t.Fatal(err)
+	}
+	if !p.seen[live.ID] {
+		t.Fatal("别行 CC 应记 seen")
+	}
+	if len(p.foreign) != 0 || p.disputeTimer != nil || disputeC != nil || len(p.outQ) != 0 {
+		t.Fatalf("在线别行 CC 不得 foreign/计时/出队 foreign=%d q=%v", len(p.foreign), kinds(p.outQ))
+	}
+	if p.ownText == "别行在线CC" || p.formal[mine.Hex()] == "别行在线CC" {
+		t.Fatal("别行 CC 不得写入本行")
+	}
+	before := p.ownText
+	if err := p.maybeWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.outQ) != 1 || p.outQ[0].Kind != protocol.TypeSubmit {
+		t.Fatalf("别行 CC 后本行仍应可写: %v", kinds(p.outQ))
+	}
+	if p.ownText == before {
+		t.Fatal("maybeWrite 应推进本行正文")
+	}
+}
+
+func TestOtherLineFollowAnswerDoesNotOverwriteOwn(t *testing.T) {
+	mine, other := model.NewID(), model.NewID()
+	p := newTestPeer("script", mine.Hex(), "本行正文")
+	p.formal[other.Hex()] = "别行正文"
+	fid := model.NewID()
+	p.foreign[fid.Hex()] = model.Dispute{
+		ID: fid, RealLine: other, Action: model.ActionEdit,
+		Person: "user", Content: []string{"别行候选"},
+	}
+	p.awaitFollow = true
+	ans := protocol.Op{
+		ID: model.NewID().Hex(), Kind: protocol.TypeFollowAnswer,
+		FollowAnswer: &protocol.FollowAnswer{
+			Type: protocol.TypeFollowAnswer, PersonID: "user",
+			FromID: "script", DisputeID: fid.Hex(), Accept: true,
+		},
+	}
+	if err := p.onFollowAnswer(ans, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.ownText != "本行正文" || p.formal[mine.Hex()] != "本行正文" {
+		t.Fatalf("别行 FollowAnswer 不得覆盖本行 own=%q formal=%q", p.ownText, p.formal[mine.Hex()])
+	}
+	if p.followTarget != "" || p.awaitFollow {
+		t.Fatalf("不得进入别行追随 follow=%q await=%v", p.followTarget, p.awaitFollow)
+	}
+	if _, ok := p.foreign[fid.Hex()]; ok {
+		t.Fatal("非本行残留 foreign 应清掉")
+	}
+}
+
+func TestFollowTargetOtherLineCCDoesNotOverwriteOwn(t *testing.T) {
+	mine, other := model.NewID(), model.NewID()
+	p := newTestPeer("script", mine.Hex(), "本行正文")
+	p.followTarget = "user"
+	p.attending = false
+	cc := protocol.Op{
+		ID: model.NewID().Hex(), Kind: protocol.TypeDisputeCC,
+		DisputeCC: &protocol.DisputeCC{
+			TargetPersonID: "script",
+			Claim: model.Dispute{
+				ID: model.NewID(), RealLine: other, Action: model.ActionEdit,
+				Person: "user", Content: []string{"追随人别行文"},
+			},
+		},
+	}
+	if err := p.onDisputeCC(cc, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.ownText != "本行正文" || p.formal[mine.Hex()] != "本行正文" {
+		t.Fatalf("追随中别行 CC 不得写本行 own=%q", p.ownText)
+	}
+	if len(p.foreign) != 0 || len(p.outQ) != 0 {
+		t.Fatalf("别行 CC 不得 foreign/CC 出队 foreign=%d q=%v", len(p.foreign), kinds(p.outQ))
+	}
+	if !p.seen[cc.ID] {
+		t.Fatal("仍应记 seen")
+	}
+}
+
+// foreign 排在 own 前时，必须先定本人 claimID 再 enqueueOwnCC，避免 NewID 与服务器同槽冲突。
+func TestBootstrapForeignBeforeOwnReusesOwnClaimID(t *testing.T) {
+	line := model.NewID()
+	ownID, fid := model.NewID(), model.NewID()
+	p := freshPeer("script")
+	var disputeC <-chan time.Time
+	boot := protocol.Bootstrap{
+		Type: protocol.TypeBootstrap, YourLine: line.Hex(),
+		Base: viewOne(line, "我的文"),
+		Disputes: []model.Dispute{
+			{ID: fid, RealLine: line, Action: model.ActionEdit, Person: "user", Content: []string{"用户文"}},
+			{ID: ownID, RealLine: line, Action: model.ActionEdit, Person: "script", Content: []string{"我的文"}},
+		},
+	}
+	if err := p.applyBootstrap(boot, &disputeC); err != nil {
+		t.Fatal(err)
+	}
+	if p.claimID != ownID {
+		t.Fatalf("claimID=%s want own %s", p.claimID.Hex(), ownID.Hex())
+	}
+	if _, self := p.foreign[ownID.Hex()]; self || len(p.foreign) != 1 || p.foreign[fid.Hex()].Person != "user" {
+		t.Fatalf("不自争议且仅导入他人: foreign=%+v", p.foreign)
+	}
+	var ccs []protocol.Op
+	for _, op := range p.outQ {
+		if op.Kind == protocol.TypeDisputeCC {
+			ccs = append(ccs, op)
+		}
+	}
+	if len(ccs) != 1 {
+		t.Fatalf("同 target/content 只一份 CC，得 %d queue=%v", len(ccs), kinds(p.outQ))
+	}
+	if ccs[0].DisputeCC == nil || ccs[0].DisputeCC.Claim.ID != ownID || ccs[0].DisputeCC.TargetPersonID != "user" {
+		t.Fatalf("CC 须用 own.ID 指向 foreign: %+v", ccs[0].DisputeCC)
+	}
+	if p.disputeTimer == nil || disputeC == nil {
+		t.Fatal("他人主张仍须 10s 决策")
+	}
+	p.stopDisputeTimer()
+}
+
 func TestReconnectAdoptBaseWhenNoPending(t *testing.T) {
 	line := model.NewID()
 	p := newTestPeer("script", line.Hex(), "断线前正文")
