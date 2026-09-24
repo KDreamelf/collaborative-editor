@@ -41,19 +41,27 @@ func main() {
 	server := flag.String("server", "http://127.0.0.1:8787", "本机协同服务")
 	article := flag.String("article", "", "已有文章 id")
 	person := flag.String("person", "", "复用 personId")
+	line := flag.String("line", "", "联测时把注意力移到已有行 id")
 	flag.Parse()
-	if err := run(*server, *article, *person); err != nil {
+	if err := run(*server, *article, *person, *line); err != nil {
 		log.Println("退出:", err)
 		os.Exit(1)
 	}
 }
 
-func run(serverURL, articleID, personID string) error {
+func run(serverURL, articleID, personID, focusLine string) error {
 	base, err := normalizeLocalServer(serverURL)
 	if err != nil {
 		return err
 	}
 	articleID, personID = strings.TrimSpace(articleID), strings.TrimSpace(personID)
+	focusLine = strings.TrimSpace(focusLine)
+	if focusLine != "" {
+		id, err := model.ParseID(focusLine)
+		if err != nil || id.IsZero() {
+			return fmt.Errorf("--line 需要已有行 ID")
+		}
+	}
 	if articleID != "" && personID == "" {
 		return fmt.Errorf("--article 须同时给 --person")
 	}
@@ -71,6 +79,7 @@ func run(serverURL, articleID, personID string) error {
 		base:        base,
 		articleID:   articleID,
 		personID:    personID,
+		focusLine:   focusLine,
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 		formal:      map[string]string{},
 		seen:        map[string]bool{},
@@ -98,6 +107,7 @@ func run(serverURL, articleID, personID string) error {
 
 type peer struct {
 	base, articleID, personID string
+	focusLine                 string
 	conn                      *websocket.Conn
 	rng                       *rand.Rand
 
@@ -250,6 +260,12 @@ func (p *peer) applyBootstrap(boot protocol.Bootstrap, disputeC *<-chan time.Tim
 		p.yourLine = boot.YourLine
 	} else if p.yourLine == "" && len(boot.Base.Lines) > 0 {
 		p.yourLine = boot.Base.Lines[0].ID.Hex()
+	}
+	if p.focusLine != "" {
+		if _, ok := p.formal[p.focusLine]; !ok {
+			return fmt.Errorf("要编辑的行已不存在")
+		}
+		p.yourLine = p.focusLine
 	}
 	baseText := ""
 	if p.yourLine != "" {

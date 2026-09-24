@@ -333,6 +333,22 @@ func TestFirstJoinBaseLatestNoCC(t *testing.T) {
 	}
 }
 
+func TestBootstrapFocusExistingLine(t *testing.T) {
+	first, second := model.NewID(), model.NewID()
+	p := freshPeer("script")
+	p.focusLine = first.Hex()
+	boot := protocol.Bootstrap{Type: protocol.TypeBootstrap, YourLine: second.Hex(),
+		Base: document.View{Article: model.Article{ID: model.NewID(), Title: "t"}, Lines: []model.Line{
+			{ID: first, Next: second, Content: "正在写的行"}, {ID: second, Prev: first},
+		}}}
+	if err := p.applyBootstrap(boot, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.yourLine != first.Hex() || p.ownText != "正在写的行" || len(p.outQ) != 0 {
+		t.Fatalf("联测夹具应移动注意力到指定已有行: line=%s text=%q queue=%v", p.yourLine, p.ownText, kinds(p.outQ))
+	}
+}
+
 func TestBootstrapOwnDisputeOnlyNoForeign(t *testing.T) {
 	line := model.NewID()
 	claimID := model.NewID()
